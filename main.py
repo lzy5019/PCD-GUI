@@ -35,6 +35,7 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QSplitter,
     QVBoxLayout,
@@ -66,6 +67,8 @@ STRONG_ULTRA_POSITIVE_FRACTION_THRESHOLD = 0.30
 BOUNDARY_CAVITATION_SCORE_THRESHOLD = 0.42
 BOUNDARY_ULTRA_POSITIVE_FRACTION_THRESHOLD = 0.15
 WAVEFORM_PREVIEW_CYCLES = 6.5
+SCATTER_BACKGROUND_GRID = 60
+SCATTER_BACKGROUND_MIN_BANDWIDTH = 0.18
 
 
 def code_root() -> Path:
@@ -92,6 +95,40 @@ def make_portable_path(path: Path) -> str:
         return path.resolve().relative_to(workspace_root()).as_posix()
     except ValueError:
         return str(path.resolve())
+
+
+def unique_destination_path(target_dir: Path, source_name: str) -> Path:
+    destination = target_dir / source_name
+    if destination.exists():
+        source_path = Path(source_name)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        destination = target_dir / f"{source_path.stem}_{timestamp}{source_path.suffix}"
+    return destination
+
+
+def reference_pattern_base_directory(patterns: list[str]) -> Path:
+    raw_pattern = next((pattern.strip() for pattern in patterns if pattern.strip()), "")
+    if not raw_pattern:
+        raise ValueError("Reference destination pattern is empty.")
+
+    raw_path = Path(raw_pattern).expanduser()
+    parts = list(raw_path.parts)
+    static_parts: list[str] = []
+    for part in parts:
+        if any(char in part for char in "*?[]"):
+            break
+        static_parts.append(part)
+
+    if static_parts:
+        base_path = Path(*static_parts)
+        if len(static_parts) == len(parts) and raw_path.suffix:
+            base_path = raw_path.parent
+    else:
+        base_path = raw_path.parent if raw_path.suffix else raw_path
+
+    if not base_path.is_absolute():
+        base_path = workspace_root() / base_path
+    return base_path.resolve()
 
 
 def join_patterns(patterns: list[str]) -> str:
@@ -222,6 +259,7 @@ class AnalysisSettings:
 class UiSettings:
     last_mode: str = "playback"
     max_live_points: int = 150
+    show_reference_points: bool = True
 
 
 @dataclass
@@ -1428,12 +1466,17 @@ class PcdScatterWidget(QWidget):
         self.no_results: list[PcdMetrics] = []
         self.cav_results: list[PcdMetrics] = []
         self.live_results: list[PcdMetrics] = []
+        self.show_reference_points = True
         self.setMinimumHeight(320)
         self.setStyleSheet("background: white;")
 
     def set_reference_results(self, no_results: list[PcdMetrics], cav_results: list[PcdMetrics]) -> None:
         self.no_results = no_results
         self.cav_results = cav_results
+        self.update()
+
+    def set_show_reference_points(self, enabled: bool) -> None:
+        self.show_reference_points = bool(enabled)
         self.update()
 
     def clear_live_results(self) -> None:
@@ -1486,6 +1529,8 @@ class PcdScatterWidget(QWidget):
             y_pixel = chart_rect.bottom() - y_ratio * chart_rect.height()
             return x_pixel, y_pixel
 
+        self._draw_reference_background(painter, chart_rect, x_min, x_max, y_min, y_max)
+
         tick_count = 5
         painter.setPen(QPen(QColor("#e5e7eb"), 1, Qt.DashLine))
         for tick_index in range(tick_count + 1):
@@ -1509,45 +1554,155 @@ class PcdScatterWidget(QWidget):
 
         painter.drawText(chart_rect.center().x() - 85, self.height() - 18, "log10(SCDultra)")
         painter.drawText(12, 18, "log10(ICD)")
-        painter.drawText(chart_rect.left(), 18, "Real-time PCD Scatter")
+        painter.drawText(chart_rect.left(), 18, "Reference Field + Real-time Scatter")
 
-        self._draw_result_group(painter, self.no_results, to_pixel, QColor("#444444"), 4)
-        self._draw_result_group(painter, self.cav_results, to_pixel, QColor("#d97706"), 5)
-        self._draw_result_group(painter, self.live_results[:-1], to_pixel, QColor("#2563eb"), 6)
+        if self.show_reference_points:
+            self._draw_result_group(painter, self.no_results, to_pixel, QColor("#1d4ed8"), 5, QColor("#eff6ff"))
+            self._draw_result_group(painter, self.cav_results, to_pixel, QColor("#dc2626"), 5, QColor("#fff1f2"))
+        self._draw_result_group(painter, self.live_results[:-1], to_pixel, QColor("#22c55e"), 7, QColor("#ecfccb"))
 
         if self.live_results:
             latest = self.live_results[-1]
-            latest_color = score_to_color(latest.cavitation_score)
             latest_x, latest_y = to_pixel(*latest.plot_coordinates())
-            painter.setBrush(latest_color)
+            painter.setBrush(QColor("#facc15"))
             painter.setPen(QPen(QColor("#0f172a"), 2))
-            painter.drawEllipse(int(latest_x) - 6, int(latest_y) - 6, 12, 12)
+            painter.drawEllipse(int(latest_x) - 7, int(latest_y) - 7, 14, 14)
+            painter.setBrush(QColor("#ffffff"))
+            painter.setPen(QPen(Qt.NoPen))
+            painter.drawEllipse(int(latest_x) - 2, int(latest_y) - 2, 4, 4)
             painter.setPen(QPen(QColor("#0f172a"), 1))
             painter.drawText(int(latest_x) + 10, int(latest_y) - 10, latest.file or "latest")
 
         self._draw_legend(painter, chart_rect)
 
-    def _draw_result_group(self, painter: QPainter, results: list[PcdMetrics], mapper, color: QColor, radius: int) -> None:
-        painter.setBrush(color)
-        painter.setPen(QPen(color, 1))
+    def _draw_reference_background(
+        self,
+        painter: QPainter,
+        chart_rect,
+        x_min: float,
+        x_max: float,
+        y_min: float,
+        y_max: float,
+    ) -> None:
+        if not self.no_results or not self.cav_results:
+            return
+
+        no_points = np.asarray([metrics.plot_coordinates() for metrics in self.no_results], dtype=float)
+        cav_points = np.asarray([metrics.plot_coordinates() for metrics in self.cav_results], dtype=float)
+        if no_points.size == 0 or cav_points.size == 0:
+            return
+
+        cols = max(28, min(SCATTER_BACKGROUND_GRID, chart_rect.width()))
+        rows = max(28, min(SCATTER_BACKGROUND_GRID, chart_rect.height()))
+        x_centers = np.linspace(x_min, x_max, cols, dtype=float)
+        y_centers = np.linspace(y_max, y_min, rows, dtype=float)
+        grid_x, grid_y = np.meshgrid(x_centers, y_centers)
+
+        bandwidth_x = max(SCATTER_BACKGROUND_MIN_BANDWIDTH, (x_max - x_min) * 0.16)
+        bandwidth_y = max(SCATTER_BACKGROUND_MIN_BANDWIDTH, (y_max - y_min) * 0.16)
+        no_density = self._compute_class_density(grid_x, grid_y, no_points, bandwidth_x, bandwidth_y)
+        cav_density = self._compute_class_density(grid_x, grid_y, cav_points, bandwidth_x, bandwidth_y)
+        total_density = no_density + cav_density
+        peak_density = float(np.max(total_density))
+        if peak_density <= FLOAT_EPS:
+            return
+
+        cav_probability = cav_density / np.maximum(total_density, FLOAT_EPS)
+        density_strength = np.sqrt(np.clip(total_density / peak_density, 0.0, 1.0))
+
+        x_edges = np.linspace(chart_rect.left(), chart_rect.left() + chart_rect.width(), cols + 1)
+        y_edges = np.linspace(chart_rect.top(), chart_rect.top() + chart_rect.height(), rows + 1)
+        low_color = np.asarray((55, 130, 246), dtype=float)
+        high_color = np.asarray((239, 68, 68), dtype=float)
+
+        for row in range(rows):
+            top = int(math.floor(y_edges[row]))
+            bottom = int(math.ceil(y_edges[row + 1]))
+            for col in range(cols):
+                left = int(math.floor(x_edges[col]))
+                right = int(math.ceil(x_edges[col + 1]))
+                probability = float(cav_probability[row, col])
+                base_rgb = low_color * (1.0 - probability) + high_color * probability
+                alpha = int(24 + 132 * float(density_strength[row, col]))
+                painter.fillRect(
+                    left,
+                    top,
+                    max(1, right - left),
+                    max(1, bottom - top),
+                    QColor(int(base_rgb[0]), int(base_rgb[1]), int(base_rgb[2]), alpha),
+                )
+
+    def _compute_class_density(
+        self,
+        grid_x: np.ndarray,
+        grid_y: np.ndarray,
+        points: np.ndarray,
+        bandwidth_x: float,
+        bandwidth_y: float,
+    ) -> np.ndarray:
+        dx = (grid_x[..., None] - points[:, 0]) / max(bandwidth_x, FLOAT_EPS)
+        dy = (grid_y[..., None] - points[:, 1]) / max(bandwidth_y, FLOAT_EPS)
+        kernel = np.exp(-0.5 * (dx * dx + dy * dy))
+        return np.mean(kernel, axis=2)
+
+    def _draw_result_group(
+        self,
+        painter: QPainter,
+        results: list[PcdMetrics],
+        mapper,
+        color: QColor,
+        radius: int,
+        halo_color: QColor | None = None,
+    ) -> None:
         for metrics in results:
             x_pixel, y_pixel = mapper(*metrics.plot_coordinates())
+            if halo_color is not None:
+                painter.setBrush(halo_color)
+                painter.setPen(QPen(Qt.NoPen))
+                halo_radius = radius + 4
+                painter.drawEllipse(int(x_pixel) - halo_radius // 2, int(y_pixel) - halo_radius // 2, halo_radius, halo_radius)
+            painter.setBrush(color)
+            painter.setPen(QPen(QColor("#0f172a"), 1))
             painter.drawEllipse(int(x_pixel) - radius // 2, int(y_pixel) - radius // 2, radius, radius)
 
     def _draw_legend(self, painter: QPainter, chart_rect) -> None:
-        legend_items = [
-            (QColor("#444444"), "Reference: no cavitation"),
-            (QColor("#d97706"), "Reference: cavitation"),
-            (QColor("#2563eb"), "Live / playback"),
-        ]
+        legend_items = []
+        if self.show_reference_points:
+            legend_items.extend(
+                [
+                    (QColor("#1d4ed8"), "Reference points: no cavitation"),
+                    (QColor("#dc2626"), "Reference points: cavitation"),
+                ]
+            )
+        legend_items.extend(
+            [
+                (QColor("#22c55e"), "Live / playback history"),
+                (QColor("#facc15"), "Latest live point"),
+            ]
+        )
         base_x = chart_rect.right() - 220
         base_y = chart_rect.top() + 10
         painter.setPen(QPen(QColor("#111827"), 1))
         for index, (color, text) in enumerate(legend_items):
             y = base_y + index * 18
             painter.setBrush(color)
+            painter.setPen(QPen(Qt.NoPen))
             painter.drawEllipse(base_x, y, 8, 8)
+            painter.setPen(QPen(QColor("#111827"), 1))
             painter.drawText(base_x + 14, y + 8, text)
+
+        scale_top = base_y + len(legend_items) * 18 + 6
+        painter.setPen(QPen(QColor("#cbd5e1"), 1))
+        painter.drawRect(base_x, scale_top, 118, 10)
+        for index in range(24):
+            ratio = index / 23 if 23 else 0.0
+            r = int(55 * (1.0 - ratio) + 239 * ratio)
+            g = int(130 * (1.0 - ratio) + 68 * ratio)
+            b = int(246 * (1.0 - ratio) + 68 * ratio)
+            painter.fillRect(base_x + 1 + index * 5, scale_top + 1, 5, 9, QColor(r, g, b, 190))
+        painter.setPen(QPen(QColor("#111827"), 1))
+        painter.drawText(base_x, scale_top + 24, "Background: no cav")
+        painter.drawText(base_x + 86, scale_top + 24, "cav")
 
 class AcquisitionWorker(QObject):
     log_message = pyqtSignal(str)
@@ -1567,6 +1722,7 @@ class AcquisitionWorker(QObject):
         self._playback_paused = False
         self._playback_step_delta = 0
         self._playback_delete_requested = False
+        self._playback_reference_copy_target: str | None = None
 
     def stop(self) -> None:
         self._stop_requested = True
@@ -1594,6 +1750,15 @@ class AcquisitionWorker(QObject):
             if self.settings.ui.last_mode != "playback" or not self._playback_files or not self._playback_paused:
                 return
             self._playback_delete_requested = True
+        self._emit_playback_state(is_active=True)
+
+    def copy_current_playback_to_reference(self, reference_group: str) -> None:
+        if reference_group not in {"no_cavitation", "cavitation"}:
+            return
+        with self._playback_lock:
+            if self.settings.ui.last_mode != "playback" or not self._playback_files or not self._playback_paused:
+                return
+            self._playback_reference_copy_target = reference_group
         self._emit_playback_state(is_active=True)
 
     @pyqtSlot()
@@ -1626,6 +1791,7 @@ class AcquisitionWorker(QObject):
             self._playback_paused = False
             self._playback_step_delta = 0
             self._playback_delete_requested = False
+            self._playback_reference_copy_target = None
         self._emit_playback_state(is_active=True)
         self.log_message.emit(f"Playback queue prepared with {len(playback_files)} files.")
         frame_index = 0
@@ -1664,7 +1830,23 @@ class AcquisitionWorker(QObject):
                 f"Playback frame {current_position}/{total_frames}: {file_path.name} -> score {metrics.cavitation_score:.3f}, risk {metrics.risk_score:.3f}"
             )
 
-            next_action, delta = self._wait_for_playback_action(self.settings.playback.interval_ms)
+            while True:
+                next_action, delta = self._wait_for_playback_action(self.settings.playback.interval_ms)
+                if next_action != "copy_reference":
+                    break
+                try:
+                    destination = self._copy_current_playback_file_to_reference(str(delta))
+                    reference_stats = build_reference_statistics(self.settings.reference, self.settings.analysis)
+                    self.reference_ready.emit(reference_stats)
+                    self.log_message.emit(
+                        f"Copied playback frame into reference '{destination.parent.name}': {destination.name}"
+                    )
+                    self.log_message.emit(
+                        f"Reference reloaded: no cavitation {len(reference_stats.no_results)} files, "
+                        f"cavitation {len(reference_stats.cav_results)} files."
+                    )
+                except Exception as exc:
+                    self.log_message.emit(f"Failed to copy playback frame into reference: {exc}")
             if next_action == "stop":
                 return
             if next_action == "delete":
@@ -1764,7 +1946,7 @@ class AcquisitionWorker(QObject):
     def _emit_playback_state(self, is_active: bool) -> None:
         self.playback_state_changed.emit(self._snapshot_playback_state(is_active))
 
-    def _wait_for_playback_action(self, interval_ms: int) -> tuple[str, int]:
+    def _wait_for_playback_action(self, interval_ms: int) -> tuple[str, int | str]:
         deadline = time.time() + max(interval_ms, 0) / 1000.0
         while True:
             if self._stop_requested:
@@ -1774,15 +1956,20 @@ class AcquisitionWorker(QObject):
                 delete_requested = self._playback_delete_requested
                 step_delta = self._playback_step_delta
                 is_paused = self._playback_paused
+                reference_copy_target = self._playback_reference_copy_target
                 if delete_requested:
                     self._playback_delete_requested = False
                 if step_delta != 0:
                     self._playback_step_delta = 0
+                if reference_copy_target is not None:
+                    self._playback_reference_copy_target = None
 
             if delete_requested:
                 return "delete", 0
             if step_delta != 0:
                 return "step", step_delta
+            if reference_copy_target is not None:
+                return "copy_reference", reference_copy_target
             if is_paused:
                 time.sleep(0.05)
                 continue
@@ -1822,10 +2009,7 @@ class AcquisitionWorker(QObject):
 
         target_dir = current_file.parent / "deleted_frames"
         target_dir.mkdir(parents=True, exist_ok=True)
-        destination = target_dir / current_file.name
-        if destination.exists():
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-            destination = target_dir / f"{current_file.stem}_{timestamp}{current_file.suffix}"
+        destination = unique_destination_path(target_dir, current_file.name)
         shutil.move(str(current_file), str(destination))
         self.log_message.emit(f"Moved playback frame to deleted_frames: {current_file.name}")
 
@@ -1844,6 +2028,26 @@ class AcquisitionWorker(QObject):
                 should_continue = True
         self._emit_playback_state(is_active=True)
         return should_continue
+
+    def _copy_current_playback_file_to_reference(self, reference_group: str) -> Path:
+        with self._playback_lock:
+            if not self._playback_files:
+                raise FileNotFoundError("Playback queue is empty.")
+            current_index = self._playback_current_index
+            current_file = self._playback_files[current_index]
+
+        if reference_group == "no_cavitation":
+            target_patterns = self.settings.reference.no_cavitation_patterns
+        elif reference_group == "cavitation":
+            target_patterns = self.settings.reference.cavitation_patterns
+        else:
+            raise ValueError(f"Unknown reference group: {reference_group}")
+
+        target_dir = reference_pattern_base_directory(target_patterns)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        destination = unique_destination_path(target_dir, current_file.name)
+        shutil.copy2(str(current_file), str(destination))
+        return destination
 
 
 class MainWindow(QMainWindow):
@@ -1906,6 +2110,10 @@ class MainWindow(QMainWindow):
         self.playback_forward1_button.clicked.connect(lambda: self._step_playback(1))
         self.playback_forward10_button = QPushButton("+10")
         self.playback_forward10_button.clicked.connect(lambda: self._step_playback(10))
+        self.playback_mark_no_button = QPushButton("记为无空化")
+        self.playback_mark_no_button.clicked.connect(lambda: self._copy_playback_frame_to_reference("no_cavitation"))
+        self.playback_mark_cav_button = QPushButton("记为空化")
+        self.playback_mark_cav_button.clicked.connect(lambda: self._copy_playback_frame_to_reference("cavitation"))
         self.playback_delete_button = QPushButton("删除当前帧")
         self.playback_delete_button.clicked.connect(self._delete_playback_frame)
 
@@ -1918,6 +2126,14 @@ class MainWindow(QMainWindow):
         playback_control_layout.addWidget(self.playback_forward1_button)
         playback_control_layout.addWidget(self.playback_forward10_button)
 
+        playback_action_row = QWidget()
+        playback_action_layout = QHBoxLayout(playback_action_row)
+        playback_action_layout.setContentsMargins(0, 0, 0, 0)
+        playback_action_layout.setSpacing(4)
+        playback_action_layout.addWidget(self.playback_mark_no_button)
+        playback_action_layout.addWidget(self.playback_mark_cav_button)
+        playback_action_layout.addWidget(self.playback_delete_button)
+
         self.playback_group = QGroupBox("回放设置")
         playback_form = QFormLayout(self.playback_group)
         playback_form.addRow("CSV 来源", self._build_path_row(self.playback_source_edit, self.playback_browse_button))
@@ -1927,7 +2143,7 @@ class MainWindow(QMainWindow):
         playback_form.addRow("当前文件", self.playback_file_label)
         playback_form.addRow("", self.playback_pause_button)
         playback_form.addRow("跳帧", playback_control_row)
-        playback_form.addRow("", self.playback_delete_button)
+        playback_form.addRow("当前帧", playback_action_row)
         left_layout.addWidget(self.playback_group)
 
         self.dll_path_edit = QLineEdit()
@@ -2007,8 +2223,29 @@ class MainWindow(QMainWindow):
         self.peak_prominence_spin.setSingleStep(1.0)
         self.peak_prominence_spin.setSuffix(" dB")
 
-        analysis_group = QGroupBox("PCD 分析设置")
-        analysis_form = QFormLayout(analysis_group)
+        self.analysis_group = QGroupBox("PCD 分析设置")
+        analysis_group_layout = QVBoxLayout(self.analysis_group)
+        analysis_group_layout.setContentsMargins(8, 8, 8, 8)
+        analysis_group_layout.setSpacing(6)
+
+        analysis_header_row = QWidget()
+        analysis_header_layout = QHBoxLayout(analysis_header_row)
+        analysis_header_layout.setContentsMargins(0, 0, 0, 0)
+        analysis_header_layout.setSpacing(6)
+        self.analysis_summary_label = QLabel("-")
+        self.analysis_summary_label.setWordWrap(True)
+        self.analysis_toggle_button = QPushButton("展开")
+        self.analysis_toggle_button.clicked.connect(self._toggle_analysis_section)
+        self.analysis_lock_button = QPushButton("解锁编辑")
+        self.analysis_lock_button.clicked.connect(self._toggle_analysis_edit_lock)
+        analysis_header_layout.addWidget(self.analysis_summary_label, stretch=1)
+        analysis_header_layout.addWidget(self.analysis_toggle_button)
+        analysis_header_layout.addWidget(self.analysis_lock_button)
+        analysis_group_layout.addWidget(analysis_header_row)
+
+        self.analysis_content_widget = QWidget()
+        analysis_form = QFormLayout(self.analysis_content_widget)
+        analysis_form.setContentsMargins(0, 0, 0, 0)
         analysis_form.addRow("无空化参考", self.reference_no_edit)
         analysis_form.addRow("有空化参考", self.reference_cav_edit)
         analysis_form.addRow("频谱模式", self.spectrum_mode_combo)
@@ -2019,15 +2256,36 @@ class MainWindow(QMainWindow):
         analysis_form.addRow("倍频范围下限", self.order_range_low_spin)
         analysis_form.addRow("倍频范围上限", self.order_range_high_spin)
         analysis_form.addRow("峰显著性阈值", self.peak_prominence_spin)
-        left_layout.addWidget(analysis_group)
+        analysis_group_layout.addWidget(self.analysis_content_widget)
+        left_layout.addWidget(self.analysis_group)
+
+        self.analysis_config_widgets = [
+            self.reference_no_edit,
+            self.reference_cav_edit,
+            self.spectrum_mode_combo,
+            self.segment_count_spin,
+            self.peak_half_width_spin,
+            self.noise_half_width_spin,
+            self.broadband_half_width_spin,
+            self.order_range_low_spin,
+            self.order_range_high_spin,
+            self.peak_prominence_spin,
+        ]
+        self.analysis_section_expanded = True
+        self.analysis_edit_locked = False
+        self._connect_analysis_summary_signals()
+        self._set_analysis_edit_locked(True)
+        self._set_analysis_section_expanded(False)
 
         self.max_live_points_spin = QSpinBox()
         self.max_live_points_spin.setRange(10, 5000)
         self.max_live_points_spin.setSingleStep(10)
+        self.show_reference_points_check = QCheckBox("显示 reference points")
 
         display_group = QGroupBox("显示设置")
         display_form = QFormLayout(display_group)
         display_form.addRow("最大实时点数", self.max_live_points_spin)
+        display_form.addRow("", self.show_reference_points_check)
         left_layout.addWidget(display_group)
 
         button_row = QHBoxLayout()
@@ -2052,6 +2310,7 @@ class MainWindow(QMainWindow):
         self.scatter_widget = PcdScatterWidget()
         self.spectrum_widget = SpectrumWidget()
         self.waveform_widget = WaveformWidget()
+        self.show_reference_points_check.toggled.connect(self.scatter_widget.set_show_reference_points)
         right_layout.addWidget(self.scatter_widget, stretch=4)
         right_layout.addWidget(self.spectrum_widget, stretch=2)
         right_layout.addWidget(self.waveform_widget, stretch=2)
@@ -2105,7 +2364,15 @@ class MainWindow(QMainWindow):
         log_layout.addWidget(self.log_output)
         right_layout.addWidget(log_group, stretch=1)
 
-        splitter.addWidget(left_panel)
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        left_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        left_scroll.setMaximumWidth(560)
+        left_scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        left_scroll.setWidget(left_panel)
+
+        splitter.addWidget(left_scroll)
         splitter.addWidget(right_panel)
         splitter.setSizes([420, 1020])
 
@@ -2117,6 +2384,45 @@ class MainWindow(QMainWindow):
         layout.addWidget(line_edit)
         layout.addWidget(button)
         return container
+
+    def _connect_analysis_summary_signals(self) -> None:
+        self.spectrum_mode_combo.currentTextChanged.connect(self._refresh_analysis_summary)
+        self.segment_count_spin.valueChanged.connect(self._refresh_analysis_summary)
+        self.peak_half_width_spin.valueChanged.connect(self._refresh_analysis_summary)
+        self.noise_half_width_spin.valueChanged.connect(self._refresh_analysis_summary)
+        self.broadband_half_width_spin.valueChanged.connect(self._refresh_analysis_summary)
+        self.order_range_low_spin.valueChanged.connect(self._refresh_analysis_summary)
+        self.order_range_high_spin.valueChanged.connect(self._refresh_analysis_summary)
+        self.peak_prominence_spin.valueChanged.connect(self._refresh_analysis_summary)
+
+    def _toggle_analysis_section(self) -> None:
+        self._set_analysis_section_expanded(not self.analysis_section_expanded)
+
+    def _set_analysis_section_expanded(self, expanded: bool) -> None:
+        self.analysis_section_expanded = bool(expanded)
+        self.analysis_content_widget.setVisible(self.analysis_section_expanded)
+        self.analysis_toggle_button.setText("收起" if self.analysis_section_expanded else "展开")
+
+    def _toggle_analysis_edit_lock(self) -> None:
+        self._set_analysis_edit_locked(not self.analysis_edit_locked)
+
+    def _set_analysis_edit_locked(self, locked: bool) -> None:
+        self.analysis_edit_locked = bool(locked)
+        for widget in self.analysis_config_widgets:
+            widget.setEnabled(not self.analysis_edit_locked)
+        self.analysis_lock_button.setText("解锁编辑" if self.analysis_edit_locked else "锁定参数")
+        self._refresh_analysis_summary()
+
+    def _refresh_analysis_summary(self) -> None:
+        lock_text = "已锁定" if self.analysis_edit_locked else "可编辑"
+        summary = (
+            f"{lock_text} | {self.spectrum_mode_combo.currentText()} | {self.segment_count_spin.value()} 段 | "
+            f"峰/噪/宽 {self.peak_half_width_spin.value():.1f}/{self.noise_half_width_spin.value():.1f}/"
+            f"{self.broadband_half_width_spin.value():.1f} kHz | "
+            f"阶次 {self.order_range_low_spin.value():.2f}~{self.order_range_high_spin.value():.2f} | "
+            f"峰阈 {self.peak_prominence_spin.value():.1f} dB"
+        )
+        self.analysis_summary_label.setText(summary)
 
     def _apply_settings_to_ui(self, settings: AppSettings) -> None:
         self.mode_combo.setCurrentIndex(0 if settings.ui.last_mode == "playback" else 1)
@@ -2144,6 +2450,8 @@ class MainWindow(QMainWindow):
         self.order_range_high_spin.setValue(settings.analysis.order_range_high)
         self.peak_prominence_spin.setValue(settings.analysis.min_peak_prominence_db)
         self.max_live_points_spin.setValue(settings.ui.max_live_points)
+        self.show_reference_points_check.setChecked(settings.ui.show_reference_points)
+        self.scatter_widget.set_show_reference_points(settings.ui.show_reference_points)
         self._set_playback_ui_state(PlaybackUiState())
 
     def _collect_settings_from_ui(self) -> AppSettings:
@@ -2183,7 +2491,11 @@ class MainWindow(QMainWindow):
                 cavitation_patterns=split_patterns(self.reference_cav_edit.text()),
             ),
             analysis=analysis_settings,
-            ui=UiSettings(last_mode=self.mode_combo.currentData(), max_live_points=self.max_live_points_spin.value()),
+            ui=UiSettings(
+                last_mode=self.mode_combo.currentData(),
+                max_live_points=self.max_live_points_spin.value(),
+                show_reference_points=self.show_reference_points_check.isChecked(),
+            ),
         )
 
     def _update_mode_visibility(self) -> None:
@@ -2211,6 +2523,8 @@ class MainWindow(QMainWindow):
         self.playback_back1_button.setEnabled(can_step)
         self.playback_forward1_button.setEnabled(can_step)
         self.playback_forward10_button.setEnabled(can_step)
+        self.playback_mark_no_button.setEnabled(can_step)
+        self.playback_mark_cav_button.setEnabled(can_step)
         self.playback_delete_button.setEnabled(can_step)
 
     def _toggle_playback_pause(self) -> None:
@@ -2235,6 +2549,20 @@ class MainWindow(QMainWindow):
         )
         if answer == QMessageBox.Yes:
             self.worker.delete_current_playback_frame()
+
+    def _copy_playback_frame_to_reference(self, reference_group: str) -> None:
+        if self.worker is None or self.mode_combo.currentData() != "playback" or not self.playback_state.current_file:
+            return
+        target_name = "无空化参考" if reference_group == "no_cavitation" else "空化参考"
+        answer = QMessageBox.question(
+            self,
+            "加入参考组",
+            f"复制当前帧到 {target_name}？\n\n{self.playback_state.current_file}",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if answer == QMessageBox.Yes:
+            self.worker.copy_current_playback_to_reference(reference_group)
 
     def _browse_playback_source(self) -> None:
         selected_dir = QFileDialog.getExistingDirectory(
