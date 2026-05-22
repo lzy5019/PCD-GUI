@@ -12,8 +12,6 @@ runtime_settings.json
 data/*
 !data/reference/
 !data/reference/**
-!data/playback/
-!data/playback/**
 
 output/
 deleted_frames/
