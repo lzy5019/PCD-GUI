@@ -1408,11 +1408,14 @@ class WaveformWidget(QWidget):
         if abs(x_max - x_min) < 1e-9:
             x_max = x_min + 1.0
 
-        y_min = float(np.min(self.waveform_mv))
-        y_max = float(np.max(self.waveform_mv))
-        if abs(y_max - y_min) < 1e-9:
-            y_min -= 1.0
-            y_max += 1.0
+        signal_y_min = float(np.min(self.waveform_mv))
+        signal_y_max = float(np.max(self.waveform_mv))
+        if abs(signal_y_max - signal_y_min) < 1e-9:
+            signal_y_min -= 1.0
+            signal_y_max += 1.0
+        vpp_mv = signal_y_max - signal_y_min
+        y_min = signal_y_min
+        y_max = signal_y_max
         y_pad = max(0.1, (y_max - y_min) * 0.12)
         y_min -= y_pad
         y_max += y_pad
@@ -1442,8 +1445,16 @@ class WaveformWidget(QWidget):
             x_pixel = chart_rect.left() + x_ratio * chart_rect.width()
             painter.drawText(int(x_pixel) - 18, chart_rect.bottom() + 18, f"{x_value:.2f}")
 
+        _, top_y = to_pixel(x_min, signal_y_max)
+        _, bottom_y = to_pixel(x_min, signal_y_min)
+        painter.drawText(10, int(top_y) + 5, f"{signal_y_max:.1f}")
+        if signal_y_min <= 0.0 <= signal_y_max:
+            _, zero_y = to_pixel(x_min, 0.0)
+            painter.drawText(18, int(zero_y) + 5, "0")
+        painter.drawText(10, int(bottom_y) + 5, f"{signal_y_min:.1f}")
+
         painter.drawText(chart_rect.center().x() - 32, self.height() - 14, "Time (us)")
-        painter.drawText(12, 36, "Amplitude")
+        painter.drawText(12, 36, "Amplitude (mV)")
 
         step = max(1, int(math.ceil(len(self.time_us) / max(chart_rect.width(), 1))))
         plot_x = self.time_us[::step]
@@ -1458,6 +1469,7 @@ class WaveformWidget(QWidget):
         if math.isfinite(self.f0_hz):
             painter.setPen(QPen(QColor("#111827"), 1))
             painter.drawText(chart_rect.right() - 148, chart_rect.top() + 18, f"f0 = {self.f0_hz / 1e6:.3f} MHz")
+        painter.drawText(chart_rect.right() - 148, chart_rect.top() + 36, f"Vpp = {vpp_mv:.1f} mV")
 
 
 class PcdScatterWidget(QWidget):
