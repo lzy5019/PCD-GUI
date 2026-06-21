@@ -6,6 +6,7 @@ import glob
 import json
 import math
 import os
+import re
 import shutil
 import sys
 import threading
@@ -38,6 +39,7 @@ from PyQt5.QtWidgets import (
     QScrollArea,
     QSpinBox,
     QSplitter,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -140,6 +142,21 @@ def split_patterns(raw_text: str) -> list[str]:
     return [part for part in parts if part]
 
 
+def parse_float_list(raw_text: str) -> list[float]:
+    normalized = raw_text.replace("，", ",").replace(";", ",")
+    return [float(part.strip()) for part in normalized.split(",") if part.strip()]
+
+
+def parse_capture_time_from_name(file_name: str) -> datetime | None:
+    match = re.search(r"(\d{8})[_-](\d{6})[_-](\d{3,6})", Path(file_name).stem)
+    if match:
+        date_text, time_text, fraction_text = match.groups()
+        microseconds = int(fraction_text.ljust(6, "0")[:6])
+        parsed = datetime.strptime(date_text + time_text, "%Y%m%d%H%M%S")
+        return parsed.replace(microsecond=microseconds)
+    return None
+
+
 def closed_interval_sequence(low: float, high: float, offset: float, step: float) -> list[float]:
     if step <= 0:
         raise ValueError("Step must be positive.")
@@ -189,6 +206,7 @@ class ReferenceSettings:
 
 @dataclass
 class AnalysisSettings:
+    algorithm_id: str = "scd_icd_peak_v1"
     spectrum_mode: str = "amplitude"
     use_segment_average: bool = True
     segment_count: int = 2
@@ -256,6 +274,35 @@ class AnalysisSettings:
 
 
 @dataclass
+class IudSettings:
+    window_count: int = 75
+    ultraharmonic_orders: list[float] = field(default_factory=lambda: [1.5, 2.5, 3.5])
+    auc_half_width_hz: float = 25e3
+    noise_half_width_hz: float = 75e3
+    subtract_local_noise: bool = False
+    baseline_window_count: int = 1
+    instability_threshold_db: float = 8.0
+    normal_reference_db: float = 4.0
+    fixed_f0_hz: float = 0.0
+
+    def validate(self, sample_count: int) -> None:
+        if self.window_count < 2:
+            raise ValueError("IUD window count must be at least 2.")
+        if sample_count // self.window_count < 16:
+            raise ValueError("IUD window count is too large for the configured sample count.")
+        if not self.ultraharmonic_orders or any(order <= 0 for order in self.ultraharmonic_orders):
+            raise ValueError("IUD ultraharmonic orders must contain positive values.")
+        if self.auc_half_width_hz <= 0:
+            raise ValueError("IUD AUC half-width must be positive.")
+        if self.noise_half_width_hz <= self.auc_half_width_hz:
+            raise ValueError("IUD noise half-width must be greater than the AUC half-width.")
+        if not 1 <= self.baseline_window_count <= self.window_count:
+            raise ValueError("IUD baseline window count must be between 1 and the total window count.")
+        if self.fixed_f0_hz < 0:
+            raise ValueError("IUD fixed f0 cannot be negative.")
+
+
+@dataclass
 class UiSettings:
     last_mode: str = "playback"
     max_live_points: int = 150
@@ -268,6 +315,7 @@ class AppSettings:
     playback: PlaybackSettings = field(default_factory=PlaybackSettings)
     reference: ReferenceSettings = field(default_factory=ReferenceSettings)
     analysis: AnalysisSettings = field(default_factory=AnalysisSettings)
+    iud: IudSettings = field(default_factory=IudSettings)
     ui: UiSettings = field(default_factory=UiSettings)
 
     def to_dict(self) -> dict:
@@ -280,6 +328,7 @@ class AppSettings:
             playback=PlaybackSettings(**data.get("playback", {})),
             reference=ReferenceSettings(**data.get("reference", {})),
             analysis=AnalysisSettings.from_dict(data.get("analysis", {})),
+            iud=IudSettings(**data.get("iud", {})),
             ui=UiSettings(**data.get("ui", {})),
         )
 
@@ -323,6 +372,30 @@ class PcdMetrics:
 
 
 @dataclass
+class IudMetrics:
+    file: str = ""
+    relative_path: str = ""
+    group_name: str = ""
+    spectrum_mode: str = "power"
+    frequency_hz: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=float))
+    spectrum: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=float))
+    f0_hz: float = math.nan
+    window_indices: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=int))
+    iud_db: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=float))
+    window_energy: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=float))
+    ultraharmonic_auc: np.ndarray = field(default_factory=lambda: np.empty((0, 0), dtype=float))
+    ultraharmonic_orders: list[float] = field(default_factory=list)
+    max_iud_db: float = math.nan
+    max_window_index: int = 0
+    first_crossing_window: int = 0
+    unstable: bool = False
+    segment_sample_count: int = 0
+    window_duration_us: float = math.nan
+    frequency_resolution_hz: float = math.nan
+    conclusion: str = ""
+
+
+@dataclass
 class ReferenceStats:
     feature_names: list[str]
     feature_scale: np.ndarray
@@ -343,7 +416,7 @@ class AnalysisFrame:
     sequence_index: int
     source_label: str
     captured_at: datetime
-    metrics: PcdMetrics
+    metrics: PcdMetrics | IudMetrics
     sample_rate_hz: float
     waveform_time_us: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=float))
     waveform_mv: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=float))
@@ -922,6 +995,108 @@ def compute_segment_average_spectrum(
     return frequency_hz, stacked, np.mean(stacked, axis=1)
 
 
+def analyze_iud_signal(
+    signal: np.ndarray,
+    sample_rate_hz: float,
+    analysis_settings: AnalysisSettings,
+    iud_settings: IudSettings,
+    file_name: str = "",
+    relative_path: str = "",
+    group_name: str = "Live",
+) -> IudMetrics:
+    target_signal = np.asarray(signal, dtype=float).reshape(-1)[: analysis_settings.target_sample_count]
+    if target_signal.size < analysis_settings.target_sample_count:
+        raise ValueError("Signal does not contain enough samples for IUD analysis.")
+    iud_settings.validate(target_signal.size)
+
+    if iud_settings.fixed_f0_hz > 0:
+        f0_hz = float(iud_settings.fixed_f0_hz)
+    else:
+        full_frequency_hz, full_spectrum = compute_single_spectrum(
+            target_signal, sample_rate_hz, analysis_settings
+        )
+        f0_hz = estimate_center_frequency(full_frequency_hz, full_spectrum, analysis_settings)
+
+    window_count = int(iud_settings.window_count)
+    segment_sample_count = target_signal.size // window_count
+    usable_sample_count = segment_sample_count * window_count
+    segmented_signal = target_signal[:usable_sample_count].reshape(window_count, segment_sample_count)
+
+    ultraharmonic_orders = [float(order) for order in iud_settings.ultraharmonic_orders]
+    auc_matrix = np.zeros((window_count, len(ultraharmonic_orders)), dtype=float)
+    spectra: list[np.ndarray] = []
+    frequency_hz = np.asarray([], dtype=float)
+
+    for window_index in range(window_count):
+        frequency_hz, display_spectrum = compute_single_spectrum(
+            segmented_signal[window_index], sample_rate_hz, analysis_settings
+        )
+        spectra.append(display_spectrum)
+        power_spectrum = display_spectrum if analysis_settings.spectrum_mode.lower() == "power" else display_spectrum**2
+        bin_width_hz = sample_rate_hz / segment_sample_count
+
+        for order_index, order in enumerate(ultraharmonic_orders):
+            center_hz = order * f0_hz
+            auc_mask = (frequency_hz >= center_hz - iud_settings.auc_half_width_hz) & (
+                frequency_hz <= center_hz + iud_settings.auc_half_width_hz
+            )
+            if not np.any(auc_mask):
+                nearest_index = int(np.argmin(np.abs(frequency_hz - center_hz)))
+                auc_mask = np.zeros_like(frequency_hz, dtype=bool)
+                auc_mask[nearest_index] = True
+
+            selected_power = np.asarray(power_spectrum[auc_mask], dtype=float)
+            if iud_settings.subtract_local_noise:
+                noise_mask = (
+                    (frequency_hz >= center_hz - iud_settings.noise_half_width_hz)
+                    & (frequency_hz <= center_hz + iud_settings.noise_half_width_hz)
+                    & (~auc_mask)
+                )
+                local_floor = float(np.mean(power_spectrum[noise_mask])) if np.any(noise_mask) else 0.0
+                selected_power = np.maximum(selected_power - local_floor, 0.0)
+            auc_matrix[window_index, order_index] = float(np.sum(selected_power) * bin_width_hz)
+
+    window_energy = np.sum(auc_matrix, axis=1)
+    baseline_count = int(iud_settings.baseline_window_count)
+    baseline_energy = float(np.mean(window_energy[:baseline_count]))
+    energy_floor = max(baseline_energy * 1e-12, FLOAT_EPS)
+    iud_db = 10.0 * np.log10(np.maximum(window_energy, energy_floor) / max(baseline_energy, energy_floor))
+    iud_db = np.asarray(iud_db, dtype=float)
+    max_position = int(np.argmax(iud_db))
+    crossing_positions = np.flatnonzero(iud_db >= iud_settings.instability_threshold_db)
+    first_crossing_window = int(crossing_positions[0] + 1) if crossing_positions.size else 0
+    unstable = bool(crossing_positions.size)
+    max_iud_db = float(iud_db[max_position])
+    conclusion = (
+        f"检测到窗内失稳，首次越阈值位于第 {first_crossing_window} 窗"
+        if unstable
+        else "未检测到窗内失稳"
+    )
+
+    return IudMetrics(
+        file=file_name,
+        relative_path=relative_path,
+        group_name=group_name,
+        spectrum_mode=analysis_settings.spectrum_mode,
+        frequency_hz=frequency_hz,
+        spectrum=np.asarray(spectra[max_position], dtype=float),
+        f0_hz=f0_hz,
+        window_indices=np.arange(1, window_count + 1, dtype=int),
+        iud_db=iud_db,
+        window_energy=window_energy,
+        ultraharmonic_auc=auc_matrix,
+        ultraharmonic_orders=ultraharmonic_orders,
+        max_iud_db=max_iud_db,
+        max_window_index=max_position + 1,
+        first_crossing_window=first_crossing_window,
+        unstable=unstable,
+        segment_sample_count=segment_sample_count,
+        window_duration_us=(segment_sample_count / sample_rate_hz) * 1e6,
+        frequency_resolution_hz=sample_rate_hz / segment_sample_count,
+        conclusion=conclusion,
+    )
+
+
 def periodic_hann(sample_count: int) -> np.ndarray:
     index = np.arange(sample_count, dtype=float)
     return 0.5 - 0.5 * np.cos((2.0 * np.pi * index) / sample_count)
@@ -1216,6 +1391,15 @@ def build_center_waveform_excerpt(
     return time_us, centered_excerpt
 
 
+def build_full_waveform(signal: np.ndarray, sample_rate_hz: float) -> tuple[np.ndarray, np.ndarray]:
+    signal_values = np.asarray(signal, dtype=float).reshape(-1)
+    if signal_values.size < 2 or not math.isfinite(sample_rate_hz) or sample_rate_hz <= 0:
+        return np.asarray([], dtype=float), np.asarray([], dtype=float)
+    centered = signal_values - float(np.mean(signal_values))
+    time_us = np.arange(centered.size, dtype=float) / sample_rate_hz * 1e6
+    return time_us, centered
+
+
 def safe_std(values: np.ndarray, axis: int = 0) -> np.ndarray:
     values = np.asarray(values, dtype=float)
     if values.shape[axis] <= 1:
@@ -1253,8 +1437,9 @@ def score_to_color(score: float) -> QColor:
 
 
 class SpectrumWidget(QWidget):
-    def __init__(self) -> None:
+    def __init__(self, title: str = "Segment-Averaged Spectrum") -> None:
         super().__init__()
+        self.title = title
         self.frequency_hz = np.asarray([], dtype=float)
         self.spectrum = np.asarray([], dtype=float)
         self.spectrum_mode = "amplitude"
@@ -1290,7 +1475,7 @@ class SpectrumWidget(QWidget):
         painter.setPen(QPen(QColor("#d0d7de"), 1))
         painter.drawRect(chart_rect)
         painter.setPen(QPen(QColor("#111827"), 1))
-        painter.drawText(chart_rect.left(), 18, "Segment-Averaged Spectrum")
+        painter.drawText(chart_rect.left(), 18, self.title)
 
         if self.frequency_hz.size == 0 or self.spectrum.size == 0:
             painter.drawText(chart_rect.center().x() - 42, chart_rect.center().y(), "No spectrum yet")
@@ -1366,8 +1551,9 @@ class SpectrumWidget(QWidget):
 
 
 class WaveformWidget(QWidget):
-    def __init__(self) -> None:
+    def __init__(self, title: str | None = None) -> None:
         super().__init__()
+        self.title = title or f"Center Waveform (~{WAVEFORM_PREVIEW_CYCLES:.1f} cycles)"
         self.time_us = np.asarray([], dtype=float)
         self.waveform_mv = np.asarray([], dtype=float)
         self.f0_hz = math.nan
@@ -1395,7 +1581,7 @@ class WaveformWidget(QWidget):
         painter.setPen(QPen(QColor("#d0d7de"), 1))
         painter.drawRect(chart_rect)
         painter.setPen(QPen(QColor("#111827"), 1))
-        painter.drawText(chart_rect.left(), 18, f"Center Waveform (~{WAVEFORM_PREVIEW_CYCLES:.1f} cycles)")
+        painter.drawText(chart_rect.left(), 18, self.title)
 
         if self.time_us.size == 0 or self.waveform_mv.size == 0:
             painter.drawText(chart_rect.center().x() - 48, chart_rect.center().y(), "No waveform yet")
@@ -1470,6 +1656,265 @@ class WaveformWidget(QWidget):
             painter.setPen(QPen(QColor("#111827"), 1))
             painter.drawText(chart_rect.right() - 148, chart_rect.top() + 18, f"f0 = {self.f0_hz / 1e6:.3f} MHz")
         painter.drawText(chart_rect.right() - 148, chart_rect.top() + 36, f"Vpp = {vpp_mv:.1f} mV")
+
+
+class IudCurveWidget(QWidget):
+    def __init__(self) -> None:
+        super().__init__()
+        self.window_indices = np.asarray([], dtype=float)
+        self.iud_db = np.asarray([], dtype=float)
+        self.normal_reference_db = 4.0
+        self.instability_threshold_db = 8.0
+        self.setMinimumHeight(260)
+        self.setStyleSheet("background: white;")
+
+    def clear_data(self) -> None:
+        self.window_indices = np.asarray([], dtype=float)
+        self.iud_db = np.asarray([], dtype=float)
+        self.update()
+
+    def set_curve(
+        self,
+        window_indices: np.ndarray,
+        iud_db: np.ndarray,
+        normal_reference_db: float,
+        instability_threshold_db: float,
+    ) -> None:
+        self.window_indices = np.asarray(window_indices, dtype=float)
+        self.iud_db = np.asarray(iud_db, dtype=float)
+        self.normal_reference_db = float(normal_reference_db)
+        self.instability_threshold_db = float(instability_threshold_db)
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.fillRect(self.rect(), QColor("#ffffff"))
+        chart_rect = self.rect().adjusted(72, 30, -28, -48)
+        painter.setPen(QPen(QColor("#d0d7de"), 1))
+        painter.drawRect(chart_rect)
+        painter.setPen(QPen(QColor("#111827"), 1))
+        painter.drawText(chart_rect.left(), 18, "Intrapulse IUD Curve")
+
+        if self.window_indices.size == 0 or self.iud_db.size == 0:
+            painter.drawText(chart_rect.center().x() - 42, chart_rect.center().y(), "No IUD data yet")
+            painter.drawText(chart_rect.center().x() - 34, self.height() - 14, "Window k")
+            painter.drawText(12, 36, "IUD (dB)")
+            return
+
+        x_min = 1.0
+        x_max = max(float(np.max(self.window_indices)), 2.0)
+        y_min = min(-2.0, float(np.floor(np.min(self.iud_db) / 2.0) * 2.0))
+        y_max = max(
+            self.instability_threshold_db + 2.0,
+            float(np.ceil(np.max(self.iud_db) / 2.0) * 2.0),
+        )
+        if y_max - y_min < 4.0:
+            y_max = y_min + 4.0
+
+        def to_pixel(x_value: float, y_value: float) -> tuple[float, float]:
+            x_ratio = (x_value - x_min) / (x_max - x_min)
+            y_ratio = (y_value - y_min) / (y_max - y_min)
+            return (
+                chart_rect.left() + x_ratio * chart_rect.width(),
+                chart_rect.bottom() - y_ratio * chart_rect.height(),
+            )
+
+        painter.setPen(QPen(QColor("#e5e7eb"), 1, Qt.DashLine))
+        for tick_index in range(6):
+            ratio = tick_index / 5
+            x_pixel = chart_rect.left() + ratio * chart_rect.width()
+            y_pixel = chart_rect.bottom() - ratio * chart_rect.height()
+            painter.drawLine(int(x_pixel), chart_rect.top(), int(x_pixel), chart_rect.bottom())
+            painter.drawLine(chart_rect.left(), int(y_pixel), chart_rect.right(), int(y_pixel))
+
+        for value, color, label in (
+            (self.normal_reference_db, QColor("#d97706"), "normal reference"),
+            (self.instability_threshold_db, QColor("#dc2626"), "instability threshold"),
+        ):
+            if y_min <= value <= y_max:
+                _, y_pixel = to_pixel(x_min, value)
+                painter.setPen(QPen(color, 1, Qt.DashLine))
+                painter.drawLine(chart_rect.left(), int(y_pixel), chart_rect.right(), int(y_pixel))
+                painter.drawText(chart_rect.right() - 150, int(y_pixel) - 4, f"{label}: {value:.1f} dB")
+
+        painter.setPen(QPen(QColor("#111827"), 1))
+        for tick_index in range(6):
+            ratio = tick_index / 5
+            x_value = x_min + ratio * (x_max - x_min)
+            y_value = y_min + ratio * (y_max - y_min)
+            x_pixel = chart_rect.left() + ratio * chart_rect.width()
+            y_pixel = chart_rect.bottom() - ratio * chart_rect.height()
+            painter.drawText(int(x_pixel) - 10, chart_rect.bottom() + 20, f"{x_value:.0f}")
+            painter.drawText(12, int(y_pixel) + 5, f"{y_value:.1f}")
+        painter.drawText(chart_rect.center().x() - 34, self.height() - 14, "Window k")
+        painter.drawText(12, 36, "IUD (dB)")
+
+        painter.setPen(QPen(QColor("#2563eb"), 2))
+        for index in range(1, self.window_indices.size):
+            x1, y1 = to_pixel(float(self.window_indices[index - 1]), float(self.iud_db[index - 1]))
+            x2, y2 = to_pixel(float(self.window_indices[index]), float(self.iud_db[index]))
+            painter.drawLine(int(x1), int(y1), int(x2), int(y2))
+
+        for x_value, y_value in zip(self.window_indices, self.iud_db):
+            x_pixel, y_pixel = to_pixel(float(x_value), float(y_value))
+            color = QColor("#dc2626") if y_value >= self.instability_threshold_db else QColor("#2563eb")
+            painter.setPen(QPen(color, 1))
+            painter.setBrush(color)
+            painter.drawEllipse(int(x_pixel) - 3, int(y_pixel) - 3, 6, 6)
+
+
+class IudTreatmentTrendWidget(QWidget):
+    def __init__(self) -> None:
+        super().__init__()
+        self.elapsed_seconds = np.asarray([], dtype=float)
+        self.mean_iud_db = np.asarray([], dtype=float)
+        self.file_names: list[str] = []
+        self.current_index = -1
+        self._hardware_start_time: datetime | None = None
+        self._playback_points: dict[str, tuple[datetime | None, float, int]] = {}
+        self.setMinimumHeight(240)
+        self.setStyleSheet("background: white;")
+
+    def clear_data(self) -> None:
+        self.elapsed_seconds = np.asarray([], dtype=float)
+        self.mean_iud_db = np.asarray([], dtype=float)
+        self.file_names = []
+        self.current_index = -1
+        self._hardware_start_time = None
+        self._playback_points = {}
+        self.update()
+
+    def add_playback_point(
+        self,
+        file_name: str,
+        mean_iud_db: float,
+        fallback_position: int,
+    ) -> None:
+        capture_time = parse_capture_time_from_name(file_name)
+        self._playback_points[file_name] = (
+            capture_time,
+            float(mean_iud_db),
+            max(1, int(fallback_position)),
+        )
+        self._hardware_start_time = None
+        valid_times = [item[0] for item in self._playback_points.values() if item[0] is not None]
+        origin = min(valid_times) if valid_times else None
+        records: list[tuple[float, int, str, float]] = []
+        for name, (timestamp, value, position) in self._playback_points.items():
+            elapsed = (
+                max(0.0, (timestamp - origin).total_seconds())
+                if timestamp is not None and origin is not None
+                else float(position - 1)
+            )
+            records.append((elapsed, position, name, value))
+        records.sort(key=lambda item: (item[0], item[1], item[2]))
+        self.elapsed_seconds = np.asarray([item[0] for item in records], dtype=float)
+        self.mean_iud_db = np.asarray([item[3] for item in records], dtype=float)
+        self.file_names = [item[2] for item in records]
+        self.set_current_file(file_name)
+
+    def set_current_file(self, file_name: str) -> None:
+        try:
+            self.current_index = self.file_names.index(Path(file_name).name)
+        except ValueError:
+            self.current_index = -1
+        self.update()
+
+    def add_hardware_point(
+        self,
+        captured_at: datetime,
+        mean_iud_db: float,
+        source_label: str,
+        max_points: int,
+    ) -> None:
+        if self._hardware_start_time is None:
+            self._hardware_start_time = captured_at
+        elapsed = max(0.0, (captured_at - self._hardware_start_time).total_seconds())
+        self.elapsed_seconds = np.append(self.elapsed_seconds, elapsed)
+        self.mean_iud_db = np.append(self.mean_iud_db, float(mean_iud_db))
+        self.file_names.append(source_label)
+        limit = max(1, int(max_points))
+        if self.mean_iud_db.size > limit:
+            remove_count = self.mean_iud_db.size - limit
+            self.elapsed_seconds = self.elapsed_seconds[remove_count:]
+            self.mean_iud_db = self.mean_iud_db[remove_count:]
+            self.file_names = self.file_names[remove_count:]
+        self.current_index = self.mean_iud_db.size - 1
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.fillRect(self.rect(), QColor("#ffffff"))
+        chart_rect = self.rect().adjusted(72, 30, -28, -48)
+        painter.setPen(QPen(QColor("#d0d7de"), 1))
+        painter.drawRect(chart_rect)
+        painter.setPen(QPen(QColor("#111827"), 1))
+        painter.drawText(chart_rect.left(), 18, "Treatment-Cycle Mean IUD")
+
+        if self.elapsed_seconds.size == 0 or self.mean_iud_db.size == 0:
+            painter.drawText(chart_rect.center().x() - 58, chart_rect.center().y(), "No treatment trend yet")
+            painter.drawText(chart_rect.center().x() - 42, self.height() - 14, "Elapsed time (s)")
+            painter.drawText(12, 36, "Mean IUD (dB)")
+            return
+
+        x_min = float(np.min(self.elapsed_seconds))
+        x_max = float(np.max(self.elapsed_seconds))
+        if x_max - x_min < 1e-9:
+            x_max = x_min + 1.0
+        y_min_data = float(np.min(self.mean_iud_db))
+        y_max_data = float(np.max(self.mean_iud_db))
+        y_pad = max(1.0, (y_max_data - y_min_data) * 0.15)
+        y_min = y_min_data - y_pad
+        y_max = y_max_data + y_pad
+
+        def to_pixel(x_value: float, y_value: float) -> tuple[float, float]:
+            x_ratio = (x_value - x_min) / (x_max - x_min)
+            y_ratio = (y_value - y_min) / (y_max - y_min)
+            return (
+                chart_rect.left() + x_ratio * chart_rect.width(),
+                chart_rect.bottom() - y_ratio * chart_rect.height(),
+            )
+
+        painter.setPen(QPen(QColor("#e5e7eb"), 1, Qt.DashLine))
+        for tick_index in range(6):
+            ratio = tick_index / 5
+            x_pixel = chart_rect.left() + ratio * chart_rect.width()
+            y_pixel = chart_rect.bottom() - ratio * chart_rect.height()
+            painter.drawLine(int(x_pixel), chart_rect.top(), int(x_pixel), chart_rect.bottom())
+            painter.drawLine(chart_rect.left(), int(y_pixel), chart_rect.right(), int(y_pixel))
+
+        painter.setPen(QPen(QColor("#111827"), 1))
+        for tick_index in range(6):
+            ratio = tick_index / 5
+            x_value = x_min + ratio * (x_max - x_min)
+            y_value = y_min + ratio * (y_max - y_min)
+            x_pixel = chart_rect.left() + ratio * chart_rect.width()
+            y_pixel = chart_rect.bottom() - ratio * chart_rect.height()
+            painter.drawText(int(x_pixel) - 14, chart_rect.bottom() + 20, f"{x_value:.1f}")
+            painter.drawText(10, int(y_pixel) + 5, f"{y_value:.1f}")
+        painter.drawText(chart_rect.center().x() - 42, self.height() - 14, "Elapsed time (s)")
+        painter.drawText(12, 36, "Mean IUD (dB)")
+
+        painter.setPen(QPen(QColor("#93c5fd"), 1))
+        for index in range(1, self.mean_iud_db.size):
+            x1, y1 = to_pixel(float(self.elapsed_seconds[index - 1]), float(self.mean_iud_db[index - 1]))
+            x2, y2 = to_pixel(float(self.elapsed_seconds[index]), float(self.mean_iud_db[index]))
+            painter.drawLine(int(x1), int(y1), int(x2), int(y2))
+
+        for index, (x_value, y_value) in enumerate(zip(self.elapsed_seconds, self.mean_iud_db)):
+            x_pixel, y_pixel = to_pixel(float(x_value), float(y_value))
+            painter.setPen(QPen(QColor("#2563eb"), 1))
+            painter.setBrush(QColor("#2563eb"))
+            painter.drawEllipse(int(x_pixel) - 3, int(y_pixel) - 3, 6, 6)
+            if index == self.current_index:
+                painter.setBrush(Qt.NoBrush)
+                painter.setPen(QPen(QColor("#f59e0b"), 3))
+                painter.drawEllipse(int(x_pixel) - 8, int(y_pixel) - 8, 16, 16)
+                label = self.file_names[index] if index < len(self.file_names) else f"Point {index + 1}"
+                painter.setPen(QPen(QColor("#111827"), 1))
+                painter.drawText(chart_rect.left() + 8, chart_rect.top() + 18, label)
 
 
 class PcdScatterWidget(QWidget):
@@ -1776,12 +2221,21 @@ class AcquisitionWorker(QObject):
     @pyqtSlot()
     def run(self) -> None:
         try:
-            self.log_message.emit("Loading reference database...")
-            reference_stats = build_reference_statistics(self.settings.reference, self.settings.analysis)
-            self.reference_ready.emit(reference_stats)
-            self.log_message.emit(
-                f"Reference loaded: no cavitation {len(reference_stats.no_results)} files, cavitation {len(reference_stats.cav_results)} files."
-            )
+            reference_stats: ReferenceStats | None = None
+            if self.settings.analysis.algorithm_id == "scd_icd_peak_v1":
+                self.log_message.emit("Loading reference database...")
+                reference_stats = build_reference_statistics(self.settings.reference, self.settings.analysis)
+                self.reference_ready.emit(reference_stats)
+                self.log_message.emit(
+                    f"Reference loaded: no cavitation {len(reference_stats.no_results)} files, cavitation {len(reference_stats.cav_results)} files."
+                )
+            elif self.settings.analysis.algorithm_id == "iud_intrapulse_v1":
+                self.log_message.emit(
+                    f"IUD analysis ready: {self.settings.iud.window_count} windows, "
+                    f"threshold {self.settings.iud.instability_threshold_db:.1f} dB."
+                )
+            else:
+                raise ValueError(f"Unsupported analysis algorithm: {self.settings.analysis.algorithm_id}")
             if self.settings.ui.last_mode == "hardware":
                 self._run_hardware(reference_stats)
             else:
@@ -1792,7 +2246,40 @@ class AcquisitionWorker(QObject):
             self._emit_playback_state(is_active=False)
             self.finished.emit()
 
-    def _run_playback(self, reference_stats: ReferenceStats) -> None:
+    def _analyze_current_signal(
+        self,
+        signal: np.ndarray,
+        sample_rate_hz: float,
+        reference_stats: ReferenceStats | None,
+        file_name: str,
+        relative_path: str,
+        group_name: str,
+    ) -> tuple[PcdMetrics | IudMetrics, np.ndarray, np.ndarray]:
+        if self.settings.analysis.algorithm_id == "iud_intrapulse_v1":
+            metrics = analyze_iud_signal(
+                signal=signal,
+                sample_rate_hz=sample_rate_hz,
+                analysis_settings=self.settings.analysis,
+                iud_settings=self.settings.iud,
+                file_name=file_name,
+                relative_path=relative_path,
+                group_name=group_name,
+            )
+            return metrics, np.asarray([], dtype=float), np.asarray([], dtype=float)
+
+        metrics = analyze_signal(
+            signal=signal,
+            sample_rate_hz=sample_rate_hz,
+            analysis_settings=self.settings.analysis,
+            reference_stats=reference_stats,
+            file_name=file_name,
+            relative_path=relative_path,
+            group_name=group_name,
+        )
+        waveform_time_us, waveform_mv = build_center_waveform_excerpt(signal, sample_rate_hz, metrics.f0_hz)
+        return metrics, waveform_time_us, waveform_mv
+
+    def _run_playback(self, reference_stats: ReferenceStats | None) -> None:
         playback_files = resolve_input_patterns(self.settings.playback.source_patterns)
         if not playback_files:
             raise FileNotFoundError("No playback CSV files matched the configured input.")
@@ -1815,16 +2302,14 @@ class AcquisitionWorker(QObject):
 
             signal, sample_rate_hz = load_signal_csv(file_path, self.settings.analysis.target_sample_count)
             effective_sample_rate = sample_rate_hz or self.settings.hardware.sample_rate_hz
-            metrics = analyze_signal(
-                signal=signal,
-                sample_rate_hz=effective_sample_rate,
-                analysis_settings=self.settings.analysis,
-                reference_stats=reference_stats,
-                file_name=file_path.name,
-                relative_path=relative_to_workspace(file_path),
-                group_name="Playback",
+            metrics, waveform_time_us, waveform_mv = self._analyze_current_signal(
+                signal,
+                effective_sample_rate,
+                reference_stats,
+                file_path.name,
+                relative_to_workspace(file_path),
+                "Playback",
             )
-            waveform_time_us, waveform_mv = build_center_waveform_excerpt(signal, effective_sample_rate, metrics.f0_hz)
             frame_index += 1
             self._emit_playback_state(is_active=True)
             self.frame_ready.emit(
@@ -1838,14 +2323,23 @@ class AcquisitionWorker(QObject):
                     waveform_mv=waveform_mv,
                 )
             )
-            self.log_message.emit(
-                f"Playback frame {current_position}/{total_frames}: {file_path.name} -> score {metrics.cavitation_score:.3f}, risk {metrics.risk_score:.3f}"
-            )
+            if isinstance(metrics, IudMetrics):
+                self.log_message.emit(
+                    f"Playback frame {current_position}/{total_frames}: {file_path.name} -> "
+                    f"max IUD {metrics.max_iud_db:.3f} dB, unstable {'yes' if metrics.unstable else 'no'}"
+                )
+            else:
+                self.log_message.emit(
+                    f"Playback frame {current_position}/{total_frames}: {file_path.name} -> score {metrics.cavitation_score:.3f}, risk {metrics.risk_score:.3f}"
+                )
 
             while True:
                 next_action, delta = self._wait_for_playback_action(self.settings.playback.interval_ms)
                 if next_action != "copy_reference":
                     break
+                if reference_stats is None:
+                    self.log_message.emit("The active IUD algorithm does not use the cavitation reference database.")
+                    continue
                 try:
                     destination = self._copy_current_playback_file_to_reference(str(delta))
                     reference_stats = build_reference_statistics(self.settings.reference, self.settings.analysis)
@@ -1873,7 +2367,7 @@ class AcquisitionWorker(QObject):
                     return
                 continue
 
-    def _run_hardware(self, reference_stats: ReferenceStats) -> None:
+    def _run_hardware(self, reference_stats: ReferenceStats | None) -> None:
         output_dir = resolve_workspace_path(self.settings.hardware.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         frame_index = 0
@@ -1893,17 +2387,13 @@ class AcquisitionWorker(QObject):
                         capture_result.voltage_mv,
                         capture_result.sample_rate_hz,
                     )
-                metrics = analyze_signal(
-                    signal=capture_result.voltage_mv,
-                    sample_rate_hz=capture_result.sample_rate_hz,
-                    analysis_settings=self.settings.analysis,
-                    reference_stats=reference_stats,
-                    file_name=saved_csv_path.name if saved_csv_path else f"capture_{frame_index + 1:04d}",
-                    relative_path=relative_to_workspace(saved_csv_path) if saved_csv_path else "",
-                    group_name="Live Acquisition",
-                )
-                waveform_time_us, waveform_mv = build_center_waveform_excerpt(
-                    capture_result.voltage_mv, capture_result.sample_rate_hz, metrics.f0_hz
+                metrics, waveform_time_us, waveform_mv = self._analyze_current_signal(
+                    capture_result.voltage_mv,
+                    capture_result.sample_rate_hz,
+                    reference_stats,
+                    saved_csv_path.name if saved_csv_path else f"capture_{frame_index + 1:04d}",
+                    relative_to_workspace(saved_csv_path) if saved_csv_path else "",
+                    "Live Acquisition",
                 )
                 frame_index += 1
                 self.frame_ready.emit(
@@ -1918,9 +2408,15 @@ class AcquisitionWorker(QObject):
                         saved_csv_path=saved_csv_path,
                     )
                 )
-                self.log_message.emit(
-                    f"Hardware frame {frame_index}: score {metrics.cavitation_score:.3f}, risk {metrics.risk_score:.3f}, file {metrics.file or 'memory'}"
-                )
+                if isinstance(metrics, IudMetrics):
+                    self.log_message.emit(
+                        f"Hardware frame {frame_index}: max IUD {metrics.max_iud_db:.3f} dB, "
+                        f"unstable {'yes' if metrics.unstable else 'no'}, file {metrics.file or 'memory'}"
+                    )
+                else:
+                    self.log_message.emit(
+                        f"Hardware frame {frame_index}: score {metrics.cavitation_score:.3f}, risk {metrics.risk_score:.3f}, file {metrics.file or 'memory'}"
+                    )
 
     def _sleep_with_stop(self, interval_ms: int) -> bool:
         deadline = time.time() + max(interval_ms, 0) / 1000.0
@@ -2200,6 +2696,10 @@ class MainWindow(QMainWindow):
         hardware_form.addRow("输出目录", self._build_path_row(self.output_dir_edit, self.output_dir_browse_button))
         left_layout.addWidget(self.hardware_group)
 
+        self.algorithm_combo = QComboBox()
+        self.algorithm_combo.addItem("经典峰值法（SCD–ICD）", "scd_icd_peak_v1")
+        self.algorithm_combo.addItem("IUD 窗内失稳分析", "iud_intrapulse_v1")
+
         self.reference_no_edit = QLineEdit()
         self.reference_cav_edit = QLineEdit()
         self.spectrum_mode_combo = QComboBox()
@@ -2235,10 +2735,45 @@ class MainWindow(QMainWindow):
         self.peak_prominence_spin.setSingleStep(1.0)
         self.peak_prominence_spin.setSuffix(" dB")
 
+        self.iud_window_count_spin = QSpinBox()
+        self.iud_window_count_spin.setRange(2, 500)
+        self.iud_orders_edit = QLineEdit()
+        self.iud_auc_half_width_spin = QDoubleSpinBox()
+        self.iud_auc_half_width_spin.setRange(0.1, 1_000.0)
+        self.iud_auc_half_width_spin.setDecimals(1)
+        self.iud_auc_half_width_spin.setSuffix(" kHz")
+        self.iud_noise_half_width_spin = QDoubleSpinBox()
+        self.iud_noise_half_width_spin.setRange(0.1, 2_000.0)
+        self.iud_noise_half_width_spin.setDecimals(1)
+        self.iud_noise_half_width_spin.setSuffix(" kHz")
+        self.iud_subtract_noise_check = QCheckBox("扣除局部噪声基线")
+        self.iud_baseline_window_count_spin = QSpinBox()
+        self.iud_baseline_window_count_spin.setRange(1, 500)
+        self.iud_threshold_spin = QDoubleSpinBox()
+        self.iud_threshold_spin.setRange(-100.0, 100.0)
+        self.iud_threshold_spin.setDecimals(1)
+        self.iud_threshold_spin.setSuffix(" dB")
+        self.iud_normal_reference_spin = QDoubleSpinBox()
+        self.iud_normal_reference_spin.setRange(-100.0, 100.0)
+        self.iud_normal_reference_spin.setDecimals(1)
+        self.iud_normal_reference_spin.setSuffix(" dB")
+        self.iud_fixed_f0_spin = QDoubleSpinBox()
+        self.iud_fixed_f0_spin.setRange(0.0, 20.0)
+        self.iud_fixed_f0_spin.setDecimals(3)
+        self.iud_fixed_f0_spin.setSingleStep(0.05)
+        self.iud_fixed_f0_spin.setSuffix(" MHz")
+        self.iud_fixed_f0_spin.setSpecialValueText("自动搜索")
+
         self.analysis_group = QGroupBox("PCD 分析设置")
         analysis_group_layout = QVBoxLayout(self.analysis_group)
         analysis_group_layout.setContentsMargins(8, 8, 8, 8)
         analysis_group_layout.setSpacing(6)
+
+        algorithm_selector = QWidget()
+        algorithm_selector_form = QFormLayout(algorithm_selector)
+        algorithm_selector_form.setContentsMargins(0, 0, 0, 0)
+        algorithm_selector_form.addRow("当前算法", self.algorithm_combo)
+        analysis_group_layout.addWidget(algorithm_selector)
 
         analysis_header_row = QWidget()
         analysis_header_layout = QHBoxLayout(analysis_header_row)
@@ -2256,18 +2791,42 @@ class MainWindow(QMainWindow):
         analysis_group_layout.addWidget(analysis_header_row)
 
         self.analysis_content_widget = QWidget()
-        analysis_form = QFormLayout(self.analysis_content_widget)
-        analysis_form.setContentsMargins(0, 0, 0, 0)
-        analysis_form.addRow("无空化参考", self.reference_no_edit)
-        analysis_form.addRow("有空化参考", self.reference_cav_edit)
-        analysis_form.addRow("频谱模式", self.spectrum_mode_combo)
-        analysis_form.addRow("分段数量", self.segment_count_spin)
-        analysis_form.addRow("峰值窗半宽", self.peak_half_width_spin)
-        analysis_form.addRow("噪声窗半宽", self.noise_half_width_spin)
-        analysis_form.addRow("宽带窗半宽", self.broadband_half_width_spin)
-        analysis_form.addRow("倍频范围下限", self.order_range_low_spin)
-        analysis_form.addRow("倍频范围上限", self.order_range_high_spin)
-        analysis_form.addRow("峰显著性阈值", self.peak_prominence_spin)
+        analysis_content_layout = QVBoxLayout(self.analysis_content_widget)
+        analysis_content_layout.setContentsMargins(0, 0, 0, 0)
+        analysis_content_layout.setSpacing(8)
+
+        common_analysis_group = QGroupBox("公共分析设置")
+        common_analysis_form = QFormLayout(common_analysis_group)
+        common_analysis_form.addRow("频谱模式", self.spectrum_mode_combo)
+        common_analysis_form.addRow("分段数量", self.segment_count_spin)
+        analysis_content_layout.addWidget(common_analysis_group)
+
+        self.algorithm_settings_stack = QStackedWidget()
+        peak_algorithm_group = QGroupBox("经典峰值法参数")
+        peak_algorithm_form = QFormLayout(peak_algorithm_group)
+        peak_algorithm_form.addRow("无空化参考", self.reference_no_edit)
+        peak_algorithm_form.addRow("有空化参考", self.reference_cav_edit)
+        peak_algorithm_form.addRow("峰值窗半宽", self.peak_half_width_spin)
+        peak_algorithm_form.addRow("噪声窗半宽", self.noise_half_width_spin)
+        peak_algorithm_form.addRow("宽带窗半宽", self.broadband_half_width_spin)
+        peak_algorithm_form.addRow("倍频范围下限", self.order_range_low_spin)
+        peak_algorithm_form.addRow("倍频范围上限", self.order_range_high_spin)
+        peak_algorithm_form.addRow("峰显著性阈值", self.peak_prominence_spin)
+        self.algorithm_settings_stack.addWidget(peak_algorithm_group)
+
+        iud_algorithm_group = QGroupBox("IUD 窗内失稳参数")
+        iud_algorithm_form = QFormLayout(iud_algorithm_group)
+        iud_algorithm_form.addRow("窗数量", self.iud_window_count_spin)
+        iud_algorithm_form.addRow("超谐波阶次", self.iud_orders_edit)
+        iud_algorithm_form.addRow("AUC 窗半宽", self.iud_auc_half_width_spin)
+        iud_algorithm_form.addRow("噪声窗半宽", self.iud_noise_half_width_spin)
+        iud_algorithm_form.addRow("", self.iud_subtract_noise_check)
+        iud_algorithm_form.addRow("基线窗数量", self.iud_baseline_window_count_spin)
+        iud_algorithm_form.addRow("正常参考线", self.iud_normal_reference_spin)
+        iud_algorithm_form.addRow("失稳阈值", self.iud_threshold_spin)
+        iud_algorithm_form.addRow("固定 f0", self.iud_fixed_f0_spin)
+        self.algorithm_settings_stack.addWidget(iud_algorithm_group)
+        analysis_content_layout.addWidget(self.algorithm_settings_stack)
         analysis_group_layout.addWidget(self.analysis_content_widget)
         left_layout.addWidget(self.analysis_group)
 
@@ -2282,6 +2841,15 @@ class MainWindow(QMainWindow):
             self.order_range_low_spin,
             self.order_range_high_spin,
             self.peak_prominence_spin,
+            self.iud_window_count_spin,
+            self.iud_orders_edit,
+            self.iud_auc_half_width_spin,
+            self.iud_noise_half_width_spin,
+            self.iud_subtract_noise_check,
+            self.iud_baseline_window_count_spin,
+            self.iud_normal_reference_spin,
+            self.iud_threshold_spin,
+            self.iud_fixed_f0_spin,
         ]
         self.analysis_section_expanded = True
         self.analysis_edit_locked = False
@@ -2315,7 +2883,12 @@ class MainWindow(QMainWindow):
         left_layout.addStretch(1)
 
         right_panel = QWidget()
-        right_layout = QVBoxLayout(right_panel)
+        right_panel_layout = QVBoxLayout(right_panel)
+        right_panel_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.algorithm_result_stack = QStackedWidget()
+        peak_result_page = QWidget()
+        right_layout = QVBoxLayout(peak_result_page)
         right_layout.setContentsMargins(8, 8, 8, 8)
         right_layout.setSpacing(10)
 
@@ -2375,6 +2948,71 @@ class MainWindow(QMainWindow):
         self.log_output.setReadOnly(True)
         log_layout.addWidget(self.log_output)
         right_layout.addWidget(log_group, stretch=1)
+        self.algorithm_result_stack.addWidget(peak_result_page)
+
+        iud_result_page = QWidget()
+        iud_result_layout = QVBoxLayout(iud_result_page)
+        iud_result_layout.setContentsMargins(8, 8, 8, 8)
+        iud_result_layout.setSpacing(10)
+        self.iud_curve_widget = IudCurveWidget()
+        self.iud_treatment_trend_widget = IudTreatmentTrendWidget()
+        iud_result_layout.addWidget(self.iud_curve_widget, stretch=4)
+        iud_result_layout.addWidget(self.iud_treatment_trend_widget, stretch=4)
+
+        iud_metrics_group = QGroupBox("最新 IUD 结果")
+        iud_metrics_layout = QGridLayout(iud_metrics_group)
+        iud_metrics_layout.setContentsMargins(8, 8, 8, 8)
+        iud_metrics_layout.setHorizontalSpacing(8)
+        iud_metrics_layout.setVerticalSpacing(4)
+        self.iud_latest_source_label = QLabel("-")
+        self.iud_latest_source_label.setWordWrap(True)
+        self.iud_latest_time_label = QLabel("-")
+        self.iud_latest_rate_label = QLabel("-")
+        self.iud_latest_f0_label = QLabel("-")
+        self.iud_latest_max_label = QLabel("-")
+        self.iud_latest_mean_label = QLabel("-")
+        self.iud_latest_max_window_label = QLabel("-")
+        self.iud_latest_crossing_label = QLabel("-")
+        self.iud_latest_window_duration_label = QLabel("-")
+        self.iud_latest_resolution_label = QLabel("-")
+        self.iud_latest_status_label = QLabel("-")
+        self.iud_latest_status_label.setWordWrap(True)
+        iud_metrics_layout.addWidget(QLabel("来源"), 0, 0)
+        iud_metrics_layout.addWidget(self.iud_latest_source_label, 0, 1)
+        iud_metrics_layout.addWidget(QLabel("时间"), 0, 2)
+        iud_metrics_layout.addWidget(self.iud_latest_time_label, 0, 3)
+        iud_metrics_layout.addWidget(QLabel("采样率"), 1, 0)
+        iud_metrics_layout.addWidget(self.iud_latest_rate_label, 1, 1)
+        iud_metrics_layout.addWidget(QLabel("f0"), 1, 2)
+        iud_metrics_layout.addWidget(self.iud_latest_f0_label, 1, 3)
+        iud_metrics_layout.addWidget(QLabel("最大 IUD"), 2, 0)
+        iud_metrics_layout.addWidget(self.iud_latest_max_label, 2, 1)
+        iud_metrics_layout.addWidget(QLabel("最大值窗"), 2, 2)
+        iud_metrics_layout.addWidget(self.iud_latest_max_window_label, 2, 3)
+        iud_metrics_layout.addWidget(QLabel("首次越阈窗"), 3, 0)
+        iud_metrics_layout.addWidget(self.iud_latest_crossing_label, 3, 1)
+        iud_metrics_layout.addWidget(QLabel("每窗时长"), 3, 2)
+        iud_metrics_layout.addWidget(self.iud_latest_window_duration_label, 3, 3)
+        iud_metrics_layout.addWidget(QLabel("平均 IUD"), 4, 0)
+        iud_metrics_layout.addWidget(self.iud_latest_mean_label, 4, 1)
+        iud_metrics_layout.addWidget(QLabel("频率分辨率"), 4, 2)
+        iud_metrics_layout.addWidget(self.iud_latest_resolution_label, 4, 3)
+        iud_metrics_layout.addWidget(QLabel("结论"), 5, 0)
+        iud_metrics_layout.addWidget(self.iud_latest_status_label, 5, 1, 1, 3)
+        iud_result_layout.addWidget(iud_metrics_group, stretch=0)
+
+        iud_log_group = QGroupBox("日志")
+        iud_log_layout = QVBoxLayout(iud_log_group)
+        self.iud_log_output = QPlainTextEdit()
+        self.iud_log_output.setReadOnly(True)
+        iud_log_layout.addWidget(self.iud_log_output)
+        iud_result_layout.addWidget(iud_log_group, stretch=1)
+        self.algorithm_result_stack.addWidget(iud_result_page)
+        self.log_outputs = [self.log_output, self.iud_log_output]
+        right_panel_layout.addWidget(self.algorithm_result_stack)
+
+        self.algorithm_combo.currentIndexChanged.connect(self._on_algorithm_changed)
+        self._on_algorithm_changed(self.algorithm_combo.currentIndex())
 
         left_scroll = QScrollArea()
         left_scroll.setWidgetResizable(True)
@@ -2397,7 +3035,21 @@ class MainWindow(QMainWindow):
         layout.addWidget(button)
         return container
 
+    def _on_algorithm_changed(self, index: int) -> None:
+        if index < 0:
+            return
+        self.algorithm_settings_stack.setCurrentIndex(index)
+        self.algorithm_result_stack.setCurrentIndex(index)
+        uses_reference_database = self.algorithm_combo.currentData() == "scd_icd_peak_v1"
+        self.show_reference_points_check.setEnabled(uses_reference_database)
+        self._set_playback_ui_state(self.playback_state)
+        self._refresh_analysis_summary()
+
+    def _sync_iud_window_limits(self) -> None:
+        self.iud_baseline_window_count_spin.setMaximum(self.iud_window_count_spin.value())
+
     def _connect_analysis_summary_signals(self) -> None:
+        self.algorithm_combo.currentTextChanged.connect(self._refresh_analysis_summary)
         self.spectrum_mode_combo.currentTextChanged.connect(self._refresh_analysis_summary)
         self.segment_count_spin.valueChanged.connect(self._refresh_analysis_summary)
         self.peak_half_width_spin.valueChanged.connect(self._refresh_analysis_summary)
@@ -2406,6 +3058,16 @@ class MainWindow(QMainWindow):
         self.order_range_low_spin.valueChanged.connect(self._refresh_analysis_summary)
         self.order_range_high_spin.valueChanged.connect(self._refresh_analysis_summary)
         self.peak_prominence_spin.valueChanged.connect(self._refresh_analysis_summary)
+        self.iud_window_count_spin.valueChanged.connect(self._sync_iud_window_limits)
+        self.iud_window_count_spin.valueChanged.connect(self._refresh_analysis_summary)
+        self.iud_orders_edit.textChanged.connect(self._refresh_analysis_summary)
+        self.iud_auc_half_width_spin.valueChanged.connect(self._refresh_analysis_summary)
+        self.iud_noise_half_width_spin.valueChanged.connect(self._refresh_analysis_summary)
+        self.iud_subtract_noise_check.toggled.connect(self._refresh_analysis_summary)
+        self.iud_baseline_window_count_spin.valueChanged.connect(self._refresh_analysis_summary)
+        self.iud_threshold_spin.valueChanged.connect(self._refresh_analysis_summary)
+        self.iud_normal_reference_spin.valueChanged.connect(self._refresh_analysis_summary)
+        self.iud_fixed_f0_spin.valueChanged.connect(self._refresh_analysis_summary)
 
     def _toggle_analysis_section(self) -> None:
         self._set_analysis_section_expanded(not self.analysis_section_expanded)
@@ -2427,13 +3089,22 @@ class MainWindow(QMainWindow):
 
     def _refresh_analysis_summary(self) -> None:
         lock_text = "已锁定" if self.analysis_edit_locked else "可编辑"
-        summary = (
-            f"{lock_text} | {self.spectrum_mode_combo.currentText()} | {self.segment_count_spin.value()} 段 | "
-            f"峰/噪/宽 {self.peak_half_width_spin.value():.1f}/{self.noise_half_width_spin.value():.1f}/"
-            f"{self.broadband_half_width_spin.value():.1f} kHz | "
-            f"阶次 {self.order_range_low_spin.value():.2f}~{self.order_range_high_spin.value():.2f} | "
-            f"峰阈 {self.peak_prominence_spin.value():.1f} dB"
-        )
+        if self.algorithm_combo.currentData() == "iud_intrapulse_v1":
+            f0_text = "自动 f0" if self.iud_fixed_f0_spin.value() <= 0 else f"f0 {self.iud_fixed_f0_spin.value():.3f} MHz"
+            summary = (
+                f"{self.algorithm_combo.currentText()} | {lock_text} | {self.iud_window_count_spin.value()} 窗 | "
+                f"UH {self.iud_orders_edit.text().strip()} | AUC ±{self.iud_auc_half_width_spin.value():.1f} kHz | "
+                f"阈值 {self.iud_threshold_spin.value():.1f} dB | {f0_text}"
+            )
+        else:
+            summary = (
+                f"{self.algorithm_combo.currentText()} | {lock_text} | "
+                f"{self.spectrum_mode_combo.currentText()} | {self.segment_count_spin.value()} 段 | "
+                f"峰/噪/宽 {self.peak_half_width_spin.value():.1f}/{self.noise_half_width_spin.value():.1f}/"
+                f"{self.broadband_half_width_spin.value():.1f} kHz | "
+                f"阶次 {self.order_range_low_spin.value():.2f}~{self.order_range_high_spin.value():.2f} | "
+                f"峰阈 {self.peak_prominence_spin.value():.1f} dB"
+            )
         self.analysis_summary_label.setText(summary)
 
     def _apply_settings_to_ui(self, settings: AppSettings) -> None:
@@ -2451,6 +3122,8 @@ class MainWindow(QMainWindow):
         self.timeout_spin.setValue(settings.hardware.timeout_seconds)
         self.save_csv_check.setChecked(settings.hardware.save_csv)
         self.output_dir_edit.setText(settings.hardware.output_dir)
+        algorithm_index = self.algorithm_combo.findData(settings.analysis.algorithm_id)
+        self.algorithm_combo.setCurrentIndex(max(algorithm_index, 0))
         self.reference_no_edit.setText(join_patterns(settings.reference.no_cavitation_patterns))
         self.reference_cav_edit.setText(join_patterns(settings.reference.cavitation_patterns))
         self.spectrum_mode_combo.setCurrentText(settings.analysis.spectrum_mode)
@@ -2461,6 +3134,16 @@ class MainWindow(QMainWindow):
         self.order_range_low_spin.setValue(settings.analysis.order_range_low)
         self.order_range_high_spin.setValue(settings.analysis.order_range_high)
         self.peak_prominence_spin.setValue(settings.analysis.min_peak_prominence_db)
+        self.iud_window_count_spin.setValue(settings.iud.window_count)
+        self._sync_iud_window_limits()
+        self.iud_orders_edit.setText(", ".join(f"{order:g}" for order in settings.iud.ultraharmonic_orders))
+        self.iud_auc_half_width_spin.setValue(settings.iud.auc_half_width_hz / 1e3)
+        self.iud_noise_half_width_spin.setValue(settings.iud.noise_half_width_hz / 1e3)
+        self.iud_subtract_noise_check.setChecked(settings.iud.subtract_local_noise)
+        self.iud_baseline_window_count_spin.setValue(settings.iud.baseline_window_count)
+        self.iud_threshold_spin.setValue(settings.iud.instability_threshold_db)
+        self.iud_normal_reference_spin.setValue(settings.iud.normal_reference_db)
+        self.iud_fixed_f0_spin.setValue(settings.iud.fixed_f0_hz / 1e6)
         self.max_live_points_spin.setValue(settings.ui.max_live_points)
         self.show_reference_points_check.setChecked(settings.ui.show_reference_points)
         self.scatter_widget.set_show_reference_points(settings.ui.show_reference_points)
@@ -2468,6 +3151,7 @@ class MainWindow(QMainWindow):
 
     def _collect_settings_from_ui(self) -> AppSettings:
         analysis_settings = AnalysisSettings.from_dict(asdict(self.settings.analysis))
+        analysis_settings.algorithm_id = self.algorithm_combo.currentData()
         analysis_settings.spectrum_mode = self.spectrum_mode_combo.currentText()
         analysis_settings.use_segment_average = self.segment_count_spin.value() > 1
         analysis_settings.segment_count = self.segment_count_spin.value()
@@ -2479,6 +3163,18 @@ class MainWindow(QMainWindow):
         analysis_settings.order_range_high = self.order_range_high_spin.value()
         analysis_settings.min_peak_prominence_db = self.peak_prominence_spin.value()
         analysis_settings.validate()
+        iud_settings = IudSettings(
+            window_count=self.iud_window_count_spin.value(),
+            ultraharmonic_orders=parse_float_list(self.iud_orders_edit.text()),
+            auc_half_width_hz=self.iud_auc_half_width_spin.value() * 1e3,
+            noise_half_width_hz=self.iud_noise_half_width_spin.value() * 1e3,
+            subtract_local_noise=self.iud_subtract_noise_check.isChecked(),
+            baseline_window_count=self.iud_baseline_window_count_spin.value(),
+            instability_threshold_db=self.iud_threshold_spin.value(),
+            normal_reference_db=self.iud_normal_reference_spin.value(),
+            fixed_f0_hz=self.iud_fixed_f0_spin.value() * 1e6,
+        )
+        iud_settings.validate(self.points_spin.value())
 
         return AppSettings(
             hardware=HardwareSettings(
@@ -2503,6 +3199,7 @@ class MainWindow(QMainWindow):
                 cavitation_patterns=split_patterns(self.reference_cav_edit.text()),
             ),
             analysis=analysis_settings,
+            iud=iud_settings,
             ui=UiSettings(
                 last_mode=self.mode_combo.currentData(),
                 max_live_points=self.max_live_points_spin.value(),
@@ -2529,14 +3226,15 @@ class MainWindow(QMainWindow):
 
         can_pause = is_playback_mode and state.is_active and state.total_frames > 0
         can_step = can_pause and state.is_paused
+        can_edit_reference = can_step and self.algorithm_combo.currentData() == "scd_icd_peak_v1"
         self.playback_pause_button.setEnabled(can_pause)
         self.playback_pause_button.setText("继续" if state.is_paused and can_pause else "暂停")
         self.playback_back10_button.setEnabled(can_step)
         self.playback_back1_button.setEnabled(can_step)
         self.playback_forward1_button.setEnabled(can_step)
         self.playback_forward10_button.setEnabled(can_step)
-        self.playback_mark_no_button.setEnabled(can_step)
-        self.playback_mark_cav_button.setEnabled(can_step)
+        self.playback_mark_no_button.setEnabled(can_edit_reference)
+        self.playback_mark_cav_button.setEnabled(can_edit_reference)
         self.playback_delete_button.setEnabled(can_step)
 
     def _toggle_playback_pause(self) -> None:
@@ -2609,6 +3307,8 @@ class MainWindow(QMainWindow):
         self.scatter_widget.clear_live_results()
         self.spectrum_widget.clear_data()
         self.waveform_widget.clear_data()
+        self.iud_curve_widget.clear_data()
+        self.iud_treatment_trend_widget.clear_data()
         self.append_log("Live points cleared.")
 
     def start_processing(self) -> None:
@@ -2624,8 +3324,11 @@ class MainWindow(QMainWindow):
         self.scatter_widget.clear_live_results()
         self.spectrum_widget.clear_data()
         self.waveform_widget.clear_data()
+        self.iud_curve_widget.clear_data()
+        self.iud_treatment_trend_widget.clear_data()
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
+        self.algorithm_combo.setEnabled(False)
         self.statusBar().showMessage("Running")
         self.append_log("Processing started.")
 
@@ -2655,8 +3358,47 @@ class MainWindow(QMainWindow):
 
     def _on_playback_state_changed(self, state: PlaybackUiState) -> None:
         self._set_playback_ui_state(state)
+        if self.settings.analysis.algorithm_id == "iud_intrapulse_v1":
+            self.iud_treatment_trend_widget.set_current_file(state.current_file)
 
     def _on_frame_ready(self, frame: AnalysisFrame) -> None:
+        if isinstance(frame.metrics, IudMetrics):
+            self.iud_curve_widget.set_curve(
+                frame.metrics.window_indices,
+                frame.metrics.iud_db,
+                self.settings.iud.normal_reference_db,
+                self.settings.iud.instability_threshold_db,
+            )
+            mean_iud_db = float(np.mean(frame.metrics.iud_db))
+            if self.settings.ui.last_mode == "hardware":
+                self.iud_treatment_trend_widget.add_hardware_point(
+                    frame.captured_at,
+                    mean_iud_db,
+                    frame.source_label,
+                    self.max_live_points_spin.value(),
+                )
+            else:
+                self.iud_treatment_trend_widget.add_playback_point(
+                    frame.source_label,
+                    mean_iud_db,
+                    self.playback_state.current_position,
+                )
+            self.iud_latest_source_label.setText(frame.source_label or "-")
+            self.iud_latest_time_label.setText(frame.captured_at.strftime("%Y-%m-%d %H:%M:%S"))
+            self.iud_latest_rate_label.setText(f"{frame.sample_rate_hz / 1e6:.3f} MHz")
+            self.iud_latest_f0_label.setText(f"{frame.metrics.f0_hz / 1e6:.3f} MHz")
+            self.iud_latest_max_label.setText(f"{frame.metrics.max_iud_db:.3f} dB")
+            self.iud_latest_mean_label.setText(f"{mean_iud_db:.3f} dB")
+            self.iud_latest_max_window_label.setText(str(frame.metrics.max_window_index))
+            self.iud_latest_crossing_label.setText(
+                str(frame.metrics.first_crossing_window) if frame.metrics.first_crossing_window else "未越阈"
+            )
+            self.iud_latest_window_duration_label.setText(f"{frame.metrics.window_duration_us:.3f} us")
+            self.iud_latest_resolution_label.setText(f"{frame.metrics.frequency_resolution_hz / 1e3:.3f} kHz")
+            self.iud_latest_status_label.setText(frame.metrics.conclusion or "-")
+            self.statusBar().showMessage(f"Latest IUD frame {frame.sequence_index}: {frame.source_label}")
+            return
+
         self.scatter_widget.add_live_result(frame.metrics, self.max_live_points_spin.value())
         self.spectrum_widget.set_spectrum(
             frame.metrics.frequency_hz,
@@ -2685,6 +3427,7 @@ class MainWindow(QMainWindow):
     def _on_worker_finished(self) -> None:
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
+        self.algorithm_combo.setEnabled(True)
         self.statusBar().showMessage("Ready")
         self._set_playback_ui_state(
             PlaybackUiState(
@@ -2701,7 +3444,9 @@ class MainWindow(QMainWindow):
 
     def append_log(self, message: str) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")
-        self.log_output.appendPlainText(f"[{timestamp}] {message}")
+        line = f"[{timestamp}] {message}"
+        for log_output in self.log_outputs:
+            log_output.appendPlainText(line)
 
     def closeEvent(self, event) -> None:
         try:
