@@ -512,7 +512,6 @@ class SignalGeneratorClient:
         if load not in ("INF", "50"):
             raise SignalGeneratorError("负载只能选择 High-Z 或 50 Ω。")
 
-        self.set_output(channel, False)
         if channel == 1:
             self.write(f"OUTP:LOAD {load}")
             self.write(f"APPL:SIN {frequency_hz:.12g},{amplitude_vpp:.12g},{offset_v:.12g}")
@@ -2869,6 +2868,7 @@ class MainWindow(QMainWindow):
         self.worker: AcquisitionWorker | None = None
         self.playback_state = PlaybackUiState()
         self.signal_generator_client = SignalGeneratorClient()
+        self.signal_generator_output_is_on: bool | None = None
         self.scpi_console_dialog: ScpiConsoleDialog | None = None
 
         self.setWindowTitle("ART + PCD Integrated Monitor")
@@ -3036,6 +3036,7 @@ class MainWindow(QMainWindow):
         self.signal_channel_combo = QComboBox()
         self.signal_channel_combo.addItem("CH1", 1)
         self.signal_channel_combo.addItem("CH2", 2)
+        self.signal_channel_combo.currentIndexChanged.connect(self._refresh_signal_generator_output_state)
         self.signal_frequency_spin = QDoubleSpinBox()
         self.signal_frequency_spin.setRange(1.0, 60_000_000.0)
         self.signal_frequency_spin.setDecimals(0)
@@ -3066,9 +3067,9 @@ class MainWindow(QMainWindow):
         self.signal_apply_button = QPushButton("输入参数")
         self.signal_apply_button.clicked.connect(self._apply_signal_generator_settings)
         self.signal_output_on_button = QPushButton("打开输出")
-        self.signal_output_on_button.clicked.connect(lambda: self._set_signal_generator_output(True))
+        self.signal_output_on_button.clicked.connect(lambda: self._set_signal_generator_output(True, confirm=True))
         self.signal_output_off_button = QPushButton("关闭输出")
-        self.signal_output_off_button.clicked.connect(lambda: self._set_signal_generator_output(False))
+        self.signal_output_off_button.clicked.connect(lambda: self._set_signal_generator_output(False, confirm=True))
         self.signal_scpi_button = QPushButton("打开 SCPI 控制台")
         self.signal_scpi_button.clicked.connect(self._open_scpi_console)
 
@@ -3128,6 +3129,7 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.signal_generator_group)
         self.signal_generator_section_expanded = True
         self._set_signal_generator_section_expanded(False)
+        self._update_signal_generator_output_buttons()
 
         self.algorithm_combo = QComboBox()
         self.algorithm_combo.addItem("经典峰值法（SCD–ICD）", "scd_icd_peak_v1")
@@ -3808,6 +3810,7 @@ class MainWindow(QMainWindow):
             return
         self.signal_identity_label.setText(identity)
         self.append_log(f"Signal generator connected: {identity}")
+        self._refresh_signal_generator_output_state()
         if "DG1062" not in identity.upper():
             QMessageBox.warning(
                 self,
@@ -3817,11 +3820,50 @@ class MainWindow(QMainWindow):
 
     def _disconnect_signal_generator(self) -> None:
         self.signal_generator_client.disconnect()
+        self.signal_generator_output_is_on = None
+        self._update_signal_generator_output_buttons()
         self.signal_identity_label.setText("未连接")
         self.append_log("Signal generator disconnected.")
 
     def _signal_generator_channel(self) -> int:
         return int(self.signal_channel_combo.currentData())
+
+    def _signal_generator_output_query(self, channel: int) -> str:
+        return "OUTP?" if channel == 1 else "OUTP:CH2?"
+
+    def _parse_signal_generator_output_state(self, raw_state: str) -> bool | None:
+        normalized = raw_state.strip().upper()
+        if normalized in {"1", "ON"}:
+            return True
+        if normalized in {"0", "OFF"}:
+            return False
+        return None
+
+    def _update_signal_generator_output_buttons(self) -> None:
+        is_connected = self.signal_generator_client.connected
+        if not is_connected or self.signal_generator_output_is_on is None:
+            self.signal_output_on_button.setEnabled(False)
+            self.signal_output_off_button.setEnabled(False)
+            return
+        self.signal_output_on_button.setEnabled(not self.signal_generator_output_is_on)
+        self.signal_output_off_button.setEnabled(self.signal_generator_output_is_on)
+
+    def _refresh_signal_generator_output_state(self, *args) -> bool | None:
+        if not self.signal_generator_client.connected:
+            self.signal_generator_output_is_on = None
+            self._update_signal_generator_output_buttons()
+            return None
+        channel = self._signal_generator_channel()
+        try:
+            raw_state = self.signal_generator_client.query(self._signal_generator_output_query(channel))
+        except Exception as exc:
+            self.signal_generator_output_is_on = None
+            self._update_signal_generator_output_buttons()
+            self.append_log(f"Signal generator output state query failed: {exc}")
+            return None
+        self.signal_generator_output_is_on = self._parse_signal_generator_output_state(raw_state)
+        self._update_signal_generator_output_buttons()
+        return self.signal_generator_output_is_on
 
     def _apply_signal_generator_settings(self) -> None:
         try:
@@ -3853,12 +3895,13 @@ class MainWindow(QMainWindow):
             f"{self.signal_amplitude_spin.value():.12g} Vpp, "
             f"PRF {self.signal_prf_spin.value():.12g} Hz, "
             f"{self.signal_cycles_spin.value()} cycles. "
-            f"Output remains OFF. {result_text}"
+            f"Output state unchanged. {result_text}"
         )
+        self._refresh_signal_generator_output_state()
 
-    def _set_signal_generator_output(self, enabled: bool) -> None:
+    def _set_signal_generator_output(self, enabled: bool, confirm: bool = True) -> bool:
         channel = self._signal_generator_channel()
-        if enabled:
+        if enabled and confirm:
             answer = QMessageBox.question(
                 self,
                 "确认打开输出",
@@ -3867,15 +3910,21 @@ class MainWindow(QMainWindow):
                 QMessageBox.No,
             )
             if answer != QMessageBox.Yes:
-                return
+                return False
         try:
             self.signal_generator_client.set_output(channel, enabled)
-            state = self.signal_generator_client.query("OUTP?" if channel == 1 else "OUTP:CH2?")
+            state = self.signal_generator_client.query(self._signal_generator_output_query(channel))
         except Exception as exc:
-            QMessageBox.critical(self, "信号发生器输出控制失败", str(exc))
             self.append_log(f"Signal generator output control failed: {exc}")
-            return
+            if confirm:
+                QMessageBox.critical(self, "信号发生器输出控制失败", str(exc))
+            self.signal_generator_output_is_on = None
+            self._update_signal_generator_output_buttons()
+            return False
+        self.signal_generator_output_is_on = self._parse_signal_generator_output_state(state)
+        self._update_signal_generator_output_buttons()
         self.append_log(f"Signal generator CH{channel} output {'ON' if enabled else 'OFF'}; query returned {state}.")
+        return True
 
     def _open_scpi_console(self) -> None:
         if not self.signal_generator_client.connected:
@@ -3901,6 +3950,16 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, "配置错误", str(exc))
             return
+
+        if self.settings.ui.last_mode == "hardware":
+            if not self.signal_generator_client.connected:
+                QMessageBox.warning(self, "信号发生器未连接", "Hardware 模式开始前，请先连接信号发生器。")
+                self.append_log("Hardware start blocked: signal generator is not connected.")
+                return
+            if not self._set_signal_generator_output(True, confirm=False):
+                QMessageBox.critical(self, "信号发生器输出失败", "无法自动打开信号发生器输出，已取消开始。")
+                self.append_log("Hardware start blocked: failed to turn signal generator output ON.")
+                return
 
         self.scatter_widget.clear_live_results()
         self.spectrum_widget.clear_data()
@@ -3929,6 +3988,8 @@ class MainWindow(QMainWindow):
         self.worker_thread.start()
 
     def stop_processing(self) -> None:
+        if self.mode_combo.currentData() == "hardware" and self.signal_generator_client.connected:
+            self._set_signal_generator_output(False, confirm=False)
         if self.worker is not None:
             self.worker.stop()
             self.append_log("Stop requested. Waiting for the current acquisition to finish...")
