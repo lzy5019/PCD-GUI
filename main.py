@@ -3105,6 +3105,12 @@ class MainWindow(QMainWindow):
         signal_header_layout.setSpacing(6)
         signal_header_layout.addWidget(QLabel("电压"), stretch=0)
         signal_header_layout.addWidget(self.signal_amplitude_spin, stretch=1)
+        self.signal_connection_badge = QLabel("未连接")
+        self.signal_connection_badge.setAlignment(Qt.AlignCenter)
+        self.signal_output_badge = QLabel("输出未知")
+        self.signal_output_badge.setAlignment(Qt.AlignCenter)
+        signal_header_layout.addWidget(self.signal_connection_badge)
+        signal_header_layout.addWidget(self.signal_output_badge)
         self.signal_generator_toggle_button = QPushButton("展开")
         self.signal_generator_toggle_button.clicked.connect(self._toggle_signal_generator_section)
         signal_header_layout.addWidget(self.signal_generator_toggle_button)
@@ -3218,11 +3224,8 @@ class MainWindow(QMainWindow):
         self.analysis_summary_label.setWordWrap(True)
         self.analysis_toggle_button = QPushButton("展开")
         self.analysis_toggle_button.clicked.connect(self._toggle_analysis_section)
-        self.analysis_lock_button = QPushButton("解锁编辑")
-        self.analysis_lock_button.clicked.connect(self._toggle_analysis_edit_lock)
         analysis_header_layout.addWidget(self.analysis_summary_label, stretch=1)
         analysis_header_layout.addWidget(self.analysis_toggle_button)
-        analysis_header_layout.addWidget(self.analysis_lock_button)
         analysis_group_layout.addWidget(analysis_header_row)
 
         self.analysis_content_widget = QWidget()
@@ -3265,31 +3268,8 @@ class MainWindow(QMainWindow):
         analysis_group_layout.addWidget(self.analysis_content_widget)
         left_layout.addWidget(self.analysis_group)
 
-        self.analysis_config_widgets = [
-            self.reference_no_edit,
-            self.reference_cav_edit,
-            self.spectrum_mode_combo,
-            self.segment_count_spin,
-            self.peak_half_width_spin,
-            self.noise_half_width_spin,
-            self.broadband_half_width_spin,
-            self.order_range_low_spin,
-            self.order_range_high_spin,
-            self.peak_prominence_spin,
-            self.iud_window_count_spin,
-            self.iud_orders_edit,
-            self.iud_auc_half_width_spin,
-            self.iud_noise_half_width_spin,
-            self.iud_subtract_noise_check,
-            self.iud_baseline_window_count_spin,
-            self.iud_normal_reference_spin,
-            self.iud_threshold_spin,
-            self.iud_fixed_f0_spin,
-        ]
         self.analysis_section_expanded = True
-        self.analysis_edit_locked = False
         self._connect_analysis_summary_signals()
-        self._set_analysis_edit_locked(True)
         self._set_analysis_section_expanded(False)
 
         self.max_live_points_spin = QSpinBox()
@@ -3460,6 +3440,8 @@ class MainWindow(QMainWindow):
         splitter.addWidget(left_scroll)
         splitter.addWidget(right_panel)
         splitter.setSizes([420, 1020])
+        self._apply_visual_theme()
+        self._set_signal_connection_visual(False)
 
     def _build_path_row(self, line_edit: QLineEdit, button: QPushButton) -> QWidget:
         container = QWidget()
@@ -3469,6 +3451,99 @@ class MainWindow(QMainWindow):
         layout.addWidget(line_edit)
         layout.addWidget(button)
         return container
+
+    def _button_style(self, background: str, border: str, foreground: str = "white") -> str:
+        return f"""
+            QPushButton {{
+                background-color: {background};
+                color: {foreground};
+                border: 1px solid {border};
+                border-radius: 5px;
+                padding: 4px 10px;
+                font-weight: 600;
+            }}
+            QPushButton:hover {{
+                border: 1px solid #111827;
+            }}
+            QPushButton:pressed {{
+                padding-top: 5px;
+                padding-bottom: 3px;
+            }}
+            QPushButton:disabled {{
+                background-color: #e5e7eb;
+                color: #9ca3af;
+                border: 1px solid #d1d5db;
+            }}
+        """
+
+    def _badge_style(self, background: str, border: str, foreground: str) -> str:
+        return (
+            f"QLabel {{ background-color: {background}; color: {foreground}; "
+            f"border: 1px solid {border}; border-radius: 8px; "
+            "padding: 3px 8px; font-weight: 700; }}"
+        )
+
+    def _apply_visual_theme(self) -> None:
+        panel_group_style = """
+            QGroupBox {
+                border: 1px solid #cbd5e1;
+                border-radius: 8px;
+                margin-top: 8px;
+                background-color: #f8fafc;
+                font-weight: 700;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 4px;
+                color: #1f2937;
+            }
+        """
+        for group in (
+            self.hardware_group,
+            self.signal_generator_group,
+            self.analysis_group,
+        ):
+            group.setStyleSheet(panel_group_style)
+
+        subtle_button = self._button_style("#f3f4f6", "#cbd5e1", "#1f2937")
+        self.hardware_toggle_button.setStyleSheet(subtle_button)
+        self.signal_generator_toggle_button.setStyleSheet(subtle_button)
+        self.analysis_toggle_button.setStyleSheet(subtle_button)
+        self.signal_scan_button.setStyleSheet(self._button_style("#2563eb", "#1d4ed8"))
+        self.signal_connect_button.setStyleSheet(self._button_style("#16a34a", "#15803d"))
+        self.signal_disconnect_button.setStyleSheet(self._button_style("#64748b", "#475569"))
+        self.signal_apply_button.setStyleSheet(self._button_style("#0ea5e9", "#0284c7"))
+        self.signal_output_on_button.setStyleSheet(self._button_style("#f97316", "#ea580c"))
+        self.signal_output_off_button.setStyleSheet(self._button_style("#dc2626", "#b91c1c"))
+        self.signal_scpi_button.setStyleSheet(self._button_style("#7c3aed", "#6d28d9"))
+        self.start_button.setStyleSheet(self._button_style("#16a34a", "#15803d"))
+        self.stop_button.setStyleSheet(self._button_style("#dc2626", "#b91c1c"))
+        self.clear_button.setStyleSheet(self._button_style("#64748b", "#475569"))
+        self.hardware_status_label.setStyleSheet("color: #475569; font-weight: 600;")
+
+    def _set_signal_connection_visual(self, connected: bool) -> None:
+        if connected:
+            style = self._badge_style("#dcfce7", "#22c55e", "#166534")
+            self.signal_connection_badge.setText("已连接")
+            self.signal_connection_badge.setStyleSheet(style)
+            self.signal_identity_label.setStyleSheet(style)
+        else:
+            style = self._badge_style("#fee2e2", "#ef4444", "#991b1b")
+            self.signal_connection_badge.setText("未连接")
+            self.signal_connection_badge.setStyleSheet(style)
+            self.signal_identity_label.setStyleSheet(style)
+
+    def _set_signal_output_visual(self, state: bool | None) -> None:
+        if state is True:
+            self.signal_output_badge.setText("输出 ON")
+            self.signal_output_badge.setStyleSheet(self._badge_style("#ffedd5", "#f97316", "#9a3412"))
+        elif state is False:
+            self.signal_output_badge.setText("输出 OFF")
+            self.signal_output_badge.setStyleSheet(self._badge_style("#e0f2fe", "#38bdf8", "#075985"))
+        else:
+            self.signal_output_badge.setText("输出未知")
+            self.signal_output_badge.setStyleSheet(self._badge_style("#f1f5f9", "#94a3b8", "#475569"))
 
     def _on_algorithm_changed(self, index: int) -> None:
         if index < 0:
@@ -3529,19 +3604,8 @@ class MainWindow(QMainWindow):
         self.signal_generator_content_widget.setVisible(self.signal_generator_section_expanded)
         self.signal_generator_toggle_button.setText("收起" if self.signal_generator_section_expanded else "展开")
 
-    def _toggle_analysis_edit_lock(self) -> None:
-        self._set_analysis_edit_locked(not self.analysis_edit_locked)
-
-    def _set_analysis_edit_locked(self, locked: bool) -> None:
-        self.analysis_edit_locked = bool(locked)
-        for widget in self.analysis_config_widgets:
-            widget.setEnabled(not self.analysis_edit_locked)
-        self.analysis_lock_button.setText("解锁编辑" if self.analysis_edit_locked else "锁定参数")
-        self._refresh_analysis_summary()
-
     def _refresh_analysis_summary(self) -> None:
-        lock_text = "已锁定" if self.analysis_edit_locked else "可编辑"
-        self.analysis_summary_label.setText(f"{self.algorithm_combo.currentText()} | {lock_text}")
+        self.analysis_summary_label.setText(self.algorithm_combo.currentText())
 
     def _apply_settings_to_ui(self, settings: AppSettings) -> None:
         self.mode_combo.setCurrentIndex(0 if settings.ui.last_mode == "playback" else 1)
@@ -3809,6 +3873,7 @@ class MainWindow(QMainWindow):
             self.append_log(f"Signal generator connect failed: {exc}")
             return
         self.signal_identity_label.setText(identity)
+        self._set_signal_connection_visual(True)
         self.append_log(f"Signal generator connected: {identity}")
         self._refresh_signal_generator_output_state()
         if "DG1062" not in identity.upper():
@@ -3820,6 +3885,7 @@ class MainWindow(QMainWindow):
 
     def _disconnect_signal_generator(self) -> None:
         self.signal_generator_client.disconnect()
+        self._set_signal_connection_visual(False)
         self.signal_generator_output_is_on = None
         self._update_signal_generator_output_buttons()
         self.signal_identity_label.setText("未连接")
@@ -3842,9 +3908,11 @@ class MainWindow(QMainWindow):
     def _update_signal_generator_output_buttons(self) -> None:
         is_connected = self.signal_generator_client.connected
         if not is_connected or self.signal_generator_output_is_on is None:
+            self._set_signal_output_visual(None)
             self.signal_output_on_button.setEnabled(False)
             self.signal_output_off_button.setEnabled(False)
             return
+        self._set_signal_output_visual(self.signal_generator_output_is_on)
         self.signal_output_on_button.setEnabled(not self.signal_generator_output_is_on)
         self.signal_output_off_button.setEnabled(self.signal_generator_output_is_on)
 
