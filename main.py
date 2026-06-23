@@ -24,6 +24,7 @@ from PyQt5.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -43,6 +44,26 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+
+class WheelSafeComboBox(QComboBox):
+    def wheelEvent(self, event) -> None:
+        event.ignore()
+
+
+class WheelSafeSpinBox(QSpinBox):
+    def wheelEvent(self, event) -> None:
+        event.ignore()
+
+
+class WheelSafeDoubleSpinBox(QDoubleSpinBox):
+    def wheelEvent(self, event) -> None:
+        event.ignore()
+
+
+QComboBox = WheelSafeComboBox
+QSpinBox = WheelSafeSpinBox
+QDoubleSpinBox = WheelSafeDoubleSpinBox
 
 
 ACTS1000_INPUT_N5000_P5000mV = 0x00
@@ -190,6 +211,19 @@ class HardwareSettings:
 
 
 @dataclass
+class SignalGeneratorSettings:
+    resource_name: str = ""
+    timeout_ms: int = 3000
+    channel: int = 1
+    frequency_hz: float = 0.6e6
+    amplitude_vpp: float = 5.0
+    offset_v: float = 0.0
+    load: str = "INF"
+    prf_hz: float = 1.0
+    burst_cycles: int = 6000
+
+
+@dataclass
 class PlaybackSettings:
     source_patterns: list[str] = field(default_factory=lambda: ["data/playback/*.csv"])
     interval_ms: int = 300
@@ -307,11 +341,15 @@ class UiSettings:
     last_mode: str = "playback"
     max_live_points: int = 150
     show_reference_points: bool = True
+    hardware_section_expanded: bool = False
+    signal_generator_section_expanded: bool = False
+    analysis_section_expanded: bool = False
 
 
 @dataclass
 class AppSettings:
     hardware: HardwareSettings = field(default_factory=HardwareSettings)
+    signal_generator: SignalGeneratorSettings = field(default_factory=SignalGeneratorSettings)
     playback: PlaybackSettings = field(default_factory=PlaybackSettings)
     reference: ReferenceSettings = field(default_factory=ReferenceSettings)
     analysis: AnalysisSettings = field(default_factory=AnalysisSettings)
@@ -325,12 +363,277 @@ class AppSettings:
     def from_dict(cls, data: dict) -> "AppSettings":
         return cls(
             hardware=HardwareSettings(**data.get("hardware", {})),
+            signal_generator=SignalGeneratorSettings(**data.get("signal_generator", {})),
             playback=PlaybackSettings(**data.get("playback", {})),
             reference=ReferenceSettings(**data.get("reference", {})),
             analysis=AnalysisSettings.from_dict(data.get("analysis", {})),
             iud=IudSettings(**data.get("iud", {})),
             ui=UiSettings(**data.get("ui", {})),
         )
+
+
+class SignalGeneratorError(RuntimeError):
+    pass
+
+
+class SignalGeneratorClient:
+    def __init__(self) -> None:
+        self._resource_manager = None
+        self._instrument = None
+        self.resource_name = ""
+        self.identity = ""
+
+    @property
+    def connected(self) -> bool:
+        return self._instrument is not None
+
+    def _get_resource_manager(self):
+        if self._resource_manager is not None:
+            return self._resource_manager
+        try:
+            import pyvisa
+        except ImportError as exc:
+            raise SignalGeneratorError(
+                "未安装 PyVISA。请先在当前环境安装 requirements.txt 中的 PyVISA。"
+            ) from exc
+        try:
+            self._resource_manager = pyvisa.ResourceManager()
+        except Exception as exc:
+            raise SignalGeneratorError(
+                "无法加载 VISA 运行库。请确认本机已安装 NI-VISA 或 RIGOL Ultra Sigma 的 VISA 组件。\n"
+                f"原始信息：{exc}"
+            ) from exc
+        return self._resource_manager
+
+    def list_resources(self) -> tuple[str, ...]:
+        try:
+            return tuple(str(item) for item in self._get_resource_manager().list_resources())
+        except SignalGeneratorError:
+            raise
+        except Exception as exc:
+            raise SignalGeneratorError(f"枚举 VISA 设备失败：{exc}") from exc
+
+    def connect(self, resource_name: str, timeout_ms: int) -> str:
+        resource_name = resource_name.strip()
+        if not resource_name:
+            raise SignalGeneratorError("请先选择或输入 VISA 资源地址。")
+        self.disconnect()
+        try:
+            instrument = self._get_resource_manager().open_resource(resource_name)
+            instrument.timeout = int(timeout_ms)
+            instrument.read_termination = "\n"
+            instrument.write_termination = "\n"
+            identity = str(instrument.query("*IDN?")).strip()
+        except Exception as exc:
+            try:
+                instrument.close()  # type: ignore[possibly-undefined]
+            except Exception:
+                pass
+            raise SignalGeneratorError(f"无法连接信号发生器或读取 *IDN?：{exc}") from exc
+        self._instrument = instrument
+        self.resource_name = resource_name
+        self.identity = identity
+        return identity
+
+    def disconnect(self) -> None:
+        instrument, self._instrument = self._instrument, None
+        self.resource_name = ""
+        self.identity = ""
+        if instrument is not None:
+            try:
+                instrument.close()
+            except Exception:
+                pass
+
+    def close(self) -> None:
+        self.disconnect()
+        manager, self._resource_manager = self._resource_manager, None
+        if manager is not None:
+            try:
+                manager.close()
+            except Exception:
+                pass
+
+    def _require_instrument(self):
+        if self._instrument is None:
+            raise SignalGeneratorError("尚未连接信号发生器。")
+        return self._instrument
+
+    def write(self, command: str) -> None:
+        command = command.strip()
+        if not command:
+            raise SignalGeneratorError("SCPI 命令不能为空。")
+        try:
+            self._require_instrument().write(command)
+        except SignalGeneratorError:
+            raise
+        except Exception as exc:
+            raise SignalGeneratorError(f"发送命令失败：{command}\n原始信息：{exc}") from exc
+
+    def query(self, command: str) -> str:
+        command = command.strip()
+        if not command:
+            raise SignalGeneratorError("SCPI 查询不能为空。")
+        try:
+            return str(self._require_instrument().query(command)).strip()
+        except SignalGeneratorError:
+            raise
+        except Exception as exc:
+            raise SignalGeneratorError(f"查询失败：{command}\n原始信息：{exc}") from exc
+
+    def set_output(self, channel: int, enabled: bool) -> None:
+        if channel == 1:
+            self.write("OUTP ON" if enabled else "OUTP OFF")
+        elif channel == 2:
+            self.write("OUTP:CH2 ON" if enabled else "OUTP:CH2 OFF")
+        else:
+            raise SignalGeneratorError("通道只能是 CH1 或 CH2。")
+
+    def configure_burst_sine(
+        self,
+        channel: int,
+        frequency_hz: float,
+        amplitude_vpp: float,
+        offset_v: float,
+        load: str,
+        prf_hz: float,
+        burst_cycles: int,
+    ) -> None:
+        if channel not in (1, 2):
+            raise SignalGeneratorError("通道只能是 CH1 或 CH2。")
+        if frequency_hz <= 0:
+            raise SignalGeneratorError("频率必须大于 0。")
+        if amplitude_vpp <= 0:
+            raise SignalGeneratorError("Vpp 必须大于 0。")
+        if prf_hz <= 0:
+            raise SignalGeneratorError("PRF 必须大于 0。")
+        if burst_cycles < 1:
+            raise SignalGeneratorError("Burst cycles 必须至少为 1。")
+        if load not in ("INF", "50"):
+            raise SignalGeneratorError("负载只能选择 High-Z 或 50 Ω。")
+
+        self.set_output(channel, False)
+        if channel == 1:
+            self.write(f"OUTP:LOAD {load}")
+            self.write(f"APPL:SIN {frequency_hz:.12g},{amplitude_vpp:.12g},{offset_v:.12g}")
+        else:
+            self.write(f"OUTP:LOAD:CH2 {load}")
+            self.write(f"APPL:SIN:CH2 {frequency_hz:.12g},{amplitude_vpp:.12g},{offset_v:.12g}")
+
+        source = f"SOURce{channel}"
+        period_s = 1.0 / prf_hz
+        for command in (
+            f"{source}:BURSt:MODE TRIGgered",
+            f"{source}:BURSt:NCYCles {int(burst_cycles)}",
+            f"{source}:BURSt:INTernal:PERiod {period_s:.12g}",
+            f"{source}:BURSt:TRIGger:SOURce INTernal",
+            f"{source}:BURSt:STATe ON",
+        ):
+            self.write(command)
+
+    def query_error(self) -> str:
+        return self.query("SYST:ERR?")
+
+
+SCPI_HINT_TEXT = """常用 SCPI 指令速查
+
+查询：
+*IDN?                 查询仪器身份
+APPL?                 查询 CH1 波形/频率/Vpp/偏置
+OUTP?                 查询 CH1 输出状态
+OUTP:CH2?             查询 CH2 输出状态
+SYST:ERR?             查询最近一次仪器错误
+
+CH1 正弦与输出：
+APPL:SIN 600000,5,0   CH1 正弦，0.6 MHz，5 Vpp，0 V offset
+OUTP ON               打开 CH1 输出
+OUTP OFF              关闭 CH1 输出
+
+CH2 正弦与输出：
+APPL:SIN:CH2 600000,5,0
+OUTP:CH2 ON
+OUTP:CH2 OFF
+
+Burst（N-cycle，内部 PRF）：
+SOURce1:BURSt:MODE TRIGgered
+SOURce1:BURSt:NCYCles 6000
+SOURce1:BURSt:INTernal:PERiod 1
+SOURce1:BURSt:TRIGger:SOURce INTernal
+SOURce1:BURSt:STATe ON
+"""
+
+
+class ScpiConsoleDialog(QDialog):
+    def __init__(self, client: SignalGeneratorClient, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.client = client
+        self.setWindowTitle("SCPI 控制台")
+        self.resize(900, 520)
+
+        root_layout = QHBoxLayout(self)
+        console_panel = QWidget()
+        console_layout = QVBoxLayout(console_panel)
+        console_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.history_output = QPlainTextEdit()
+        self.history_output.setReadOnly(True)
+        self.command_edit = QLineEdit()
+        self.command_edit.setPlaceholderText("输入 SCPI，例如 *IDN? 或 APPL:SIN 600000,5,0")
+        self.command_edit.returnPressed.connect(self._query_or_write)
+
+        button_row = QHBoxLayout()
+        self.query_button = QPushButton("查询 Query")
+        self.write_button = QPushButton("发送 Write")
+        self.error_button = QPushButton("查错误 SYST:ERR?")
+        self.query_button.clicked.connect(self._query)
+        self.write_button.clicked.connect(self._write)
+        self.error_button.clicked.connect(self._query_error)
+        button_row.addWidget(self.query_button)
+        button_row.addWidget(self.write_button)
+        button_row.addWidget(self.error_button)
+
+        console_layout.addWidget(self.history_output, stretch=1)
+        console_layout.addWidget(self.command_edit)
+        console_layout.addLayout(button_row)
+
+        hint_output = QPlainTextEdit()
+        hint_output.setReadOnly(True)
+        hint_output.setPlainText(SCPI_HINT_TEXT)
+        hint_output.setMinimumWidth(330)
+
+        root_layout.addWidget(console_panel, stretch=3)
+        root_layout.addWidget(hint_output, stretch=2)
+
+    def _append(self, text: str) -> None:
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.history_output.appendPlainText(f"[{timestamp}] {text}")
+
+    def _query_or_write(self) -> None:
+        command = self.command_edit.text().strip()
+        if command.endswith("?"):
+            self._query()
+        else:
+            self._write()
+
+    def _query(self) -> None:
+        command = self.command_edit.text().strip()
+        try:
+            response = self.client.query(command)
+            self._append(f"> {command}\n< {response}")
+        except Exception as exc:
+            self._append(f"ERROR: {exc}")
+
+    def _write(self) -> None:
+        command = self.command_edit.text().strip()
+        try:
+            self.client.write(command)
+            self._append(f"> {command}\nOK")
+        except Exception as exc:
+            self._append(f"ERROR: {exc}")
+
+    def _query_error(self) -> None:
+        self.command_edit.setText("SYST:ERR?")
+        self._query()
 
 
 @dataclass
@@ -2565,6 +2868,8 @@ class MainWindow(QMainWindow):
         self.worker_thread: QThread | None = None
         self.worker: AcquisitionWorker | None = None
         self.playback_state = PlaybackUiState()
+        self.signal_generator_client = SignalGeneratorClient()
+        self.scpi_console_dialog: ScpiConsoleDialog | None = None
 
         self.setWindowTitle("ART + PCD Integrated Monitor")
         self.resize(1480, 900)
@@ -2683,7 +2988,21 @@ class MainWindow(QMainWindow):
         self.output_dir_browse_button.clicked.connect(self._browse_output_dir)
 
         self.hardware_group = QGroupBox("ART 采集设置")
-        hardware_form = QFormLayout(self.hardware_group)
+        hardware_group_layout = QVBoxLayout(self.hardware_group)
+        hardware_group_layout.setContentsMargins(8, 8, 8, 8)
+        hardware_group_layout.setSpacing(6)
+        hardware_header_row = QWidget()
+        hardware_header_layout = QHBoxLayout(hardware_header_row)
+        hardware_header_layout.setContentsMargins(0, 0, 0, 0)
+        self.hardware_status_label = QLabel("ART 采集卡连接和采样参数")
+        self.hardware_status_label.setWordWrap(True)
+        self.hardware_toggle_button = QPushButton("展开")
+        self.hardware_toggle_button.clicked.connect(self._toggle_hardware_section)
+        hardware_header_layout.addWidget(self.hardware_status_label, stretch=1)
+        hardware_header_layout.addWidget(self.hardware_toggle_button)
+        hardware_group_layout.addWidget(hardware_header_row)
+        self.hardware_content_widget = QWidget()
+        hardware_form = QFormLayout(self.hardware_content_widget)
         hardware_form.addRow("DLL 路径", self._build_path_row(self.dll_path_edit, self.dll_browse_button))
         hardware_form.addRow("设备 ID", self.device_id_spin)
         hardware_form.addRow("采样率", self.sample_rate_spin)
@@ -2694,7 +3013,121 @@ class MainWindow(QMainWindow):
         hardware_form.addRow("读超时", self.timeout_spin)
         hardware_form.addRow("", self.save_csv_check)
         hardware_form.addRow("输出目录", self._build_path_row(self.output_dir_edit, self.output_dir_browse_button))
+        hardware_group_layout.addWidget(self.hardware_content_widget)
         left_layout.addWidget(self.hardware_group)
+        self.hardware_section_expanded = True
+        self._set_hardware_section_expanded(False)
+
+        self.signal_resource_combo = QComboBox()
+        self.signal_resource_combo.setEditable(True)
+        self.signal_scan_button = QPushButton("扫描")
+        self.signal_scan_button.clicked.connect(self._scan_signal_generator_resources)
+        self.signal_connect_button = QPushButton("连接")
+        self.signal_connect_button.clicked.connect(self._connect_signal_generator)
+        self.signal_disconnect_button = QPushButton("断开")
+        self.signal_disconnect_button.clicked.connect(self._disconnect_signal_generator)
+        self.signal_identity_label = QLabel("未连接")
+        self.signal_identity_label.setWordWrap(True)
+
+        self.signal_timeout_spin = QSpinBox()
+        self.signal_timeout_spin.setRange(500, 30_000)
+        self.signal_timeout_spin.setSingleStep(500)
+        self.signal_timeout_spin.setSuffix(" ms")
+        self.signal_channel_combo = QComboBox()
+        self.signal_channel_combo.addItem("CH1", 1)
+        self.signal_channel_combo.addItem("CH2", 2)
+        self.signal_frequency_spin = QDoubleSpinBox()
+        self.signal_frequency_spin.setRange(1.0, 60_000_000.0)
+        self.signal_frequency_spin.setDecimals(0)
+        self.signal_frequency_spin.setSingleStep(100_000.0)
+        self.signal_frequency_spin.setSuffix(" Hz")
+        self.signal_amplitude_spin = QDoubleSpinBox()
+        self.signal_amplitude_spin.setRange(0.001, 20.0)
+        self.signal_amplitude_spin.setDecimals(3)
+        self.signal_amplitude_spin.setSingleStep(0.1)
+        self.signal_amplitude_spin.setSuffix(" Vpp")
+        self.signal_load_combo = QComboBox()
+        self.signal_load_combo.addItem("High-Z", "INF")
+        self.signal_load_combo.addItem("50 Ω", "50")
+        self.signal_burst_mode_label = QLabel("N-cycle（固定）")
+        self.signal_prf_spin = QDoubleSpinBox()
+        self.signal_prf_spin.setRange(0.001, 10_000.0)
+        self.signal_prf_spin.setDecimals(3)
+        self.signal_prf_spin.setSingleStep(1.0)
+        self.signal_prf_spin.setSuffix(" Hz")
+        self.signal_cycles_spin = QSpinBox()
+        self.signal_cycles_spin.setRange(1, 1_000_000)
+        self.signal_cycles_spin.setSingleStep(100)
+        self.signal_duty_label = QLabel("-")
+        self.signal_frequency_spin.valueChanged.connect(self._refresh_signal_generator_summary)
+        self.signal_prf_spin.valueChanged.connect(self._refresh_signal_generator_summary)
+        self.signal_cycles_spin.valueChanged.connect(self._refresh_signal_generator_summary)
+
+        self.signal_apply_button = QPushButton("输入参数")
+        self.signal_apply_button.clicked.connect(self._apply_signal_generator_settings)
+        self.signal_output_on_button = QPushButton("打开输出")
+        self.signal_output_on_button.clicked.connect(lambda: self._set_signal_generator_output(True))
+        self.signal_output_off_button = QPushButton("关闭输出")
+        self.signal_output_off_button.clicked.connect(lambda: self._set_signal_generator_output(False))
+        self.signal_scpi_button = QPushButton("打开 SCPI 控制台")
+        self.signal_scpi_button.clicked.connect(self._open_scpi_console)
+
+        signal_resource_row = QWidget()
+        signal_resource_layout = QHBoxLayout(signal_resource_row)
+        signal_resource_layout.setContentsMargins(0, 0, 0, 0)
+        signal_resource_layout.setSpacing(4)
+        signal_resource_layout.addWidget(self.signal_resource_combo, stretch=1)
+        signal_resource_layout.addWidget(self.signal_scan_button)
+
+        signal_connection_row = QWidget()
+        signal_connection_layout = QHBoxLayout(signal_connection_row)
+        signal_connection_layout.setContentsMargins(0, 0, 0, 0)
+        signal_connection_layout.setSpacing(4)
+        signal_connection_layout.addWidget(self.signal_connect_button)
+        signal_connection_layout.addWidget(self.signal_disconnect_button)
+
+        signal_action_row = QWidget()
+        signal_action_layout = QHBoxLayout(signal_action_row)
+        signal_action_layout.setContentsMargins(0, 0, 0, 0)
+        signal_action_layout.setSpacing(4)
+        signal_action_layout.addWidget(self.signal_apply_button)
+        signal_action_layout.addWidget(self.signal_output_off_button)
+        signal_action_layout.addWidget(self.signal_output_on_button)
+
+        self.signal_generator_group = QGroupBox("信号发生器手动设置")
+        signal_group_layout = QVBoxLayout(self.signal_generator_group)
+        signal_group_layout.setContentsMargins(8, 8, 8, 8)
+        signal_group_layout.setSpacing(6)
+        signal_header_row = QWidget()
+        signal_header_layout = QHBoxLayout(signal_header_row)
+        signal_header_layout.setContentsMargins(0, 0, 0, 0)
+        signal_header_layout.setSpacing(6)
+        signal_header_layout.addWidget(QLabel("电压"), stretch=0)
+        signal_header_layout.addWidget(self.signal_amplitude_spin, stretch=1)
+        self.signal_generator_toggle_button = QPushButton("展开")
+        self.signal_generator_toggle_button.clicked.connect(self._toggle_signal_generator_section)
+        signal_header_layout.addWidget(self.signal_generator_toggle_button)
+        signal_group_layout.addWidget(signal_header_row)
+
+        self.signal_generator_content_widget = QWidget()
+        signal_form = QFormLayout(self.signal_generator_content_widget)
+        signal_form.addRow("VISA 地址", signal_resource_row)
+        signal_form.addRow("连接", signal_connection_row)
+        signal_form.addRow("身份返回", self.signal_identity_label)
+        signal_form.addRow("超时", self.signal_timeout_spin)
+        signal_form.addRow("通道", self.signal_channel_combo)
+        signal_form.addRow("频率", self.signal_frequency_spin)
+        signal_form.addRow("负载", self.signal_load_combo)
+        signal_form.addRow("Burst 模式", self.signal_burst_mode_label)
+        signal_form.addRow("PRF", self.signal_prf_spin)
+        signal_form.addRow("Cycles", self.signal_cycles_spin)
+        signal_form.addRow("估算占空比", self.signal_duty_label)
+        signal_form.addRow("操作", signal_action_row)
+        signal_form.addRow("", self.signal_scpi_button)
+        signal_group_layout.addWidget(self.signal_generator_content_widget)
+        left_layout.addWidget(self.signal_generator_group)
+        self.signal_generator_section_expanded = True
+        self._set_signal_generator_section_expanded(False)
 
         self.algorithm_combo = QComboBox()
         self.algorithm_combo.addItem("经典峰值法（SCD–ICD）", "scd_icd_peak_v1")
@@ -2779,7 +3212,7 @@ class MainWindow(QMainWindow):
         analysis_header_layout = QHBoxLayout(analysis_header_row)
         analysis_header_layout.setContentsMargins(0, 0, 0, 0)
         analysis_header_layout.setSpacing(6)
-        self.analysis_summary_label = QLabel("-")
+        self.analysis_summary_label = QLabel("PCD 分析参数")
         self.analysis_summary_label.setWordWrap(True)
         self.analysis_toggle_button = QPushButton("展开")
         self.analysis_toggle_button.clicked.connect(self._toggle_analysis_section)
@@ -3076,6 +3509,23 @@ class MainWindow(QMainWindow):
         self.analysis_section_expanded = bool(expanded)
         self.analysis_content_widget.setVisible(self.analysis_section_expanded)
         self.analysis_toggle_button.setText("收起" if self.analysis_section_expanded else "展开")
+        self._refresh_analysis_summary()
+
+    def _toggle_hardware_section(self) -> None:
+        self._set_hardware_section_expanded(not self.hardware_section_expanded)
+
+    def _set_hardware_section_expanded(self, expanded: bool) -> None:
+        self.hardware_section_expanded = bool(expanded)
+        self.hardware_content_widget.setVisible(self.hardware_section_expanded)
+        self.hardware_toggle_button.setText("收起" if self.hardware_section_expanded else "展开")
+
+    def _toggle_signal_generator_section(self) -> None:
+        self._set_signal_generator_section_expanded(not self.signal_generator_section_expanded)
+
+    def _set_signal_generator_section_expanded(self, expanded: bool) -> None:
+        self.signal_generator_section_expanded = bool(expanded)
+        self.signal_generator_content_widget.setVisible(self.signal_generator_section_expanded)
+        self.signal_generator_toggle_button.setText("收起" if self.signal_generator_section_expanded else "展开")
 
     def _toggle_analysis_edit_lock(self) -> None:
         self._set_analysis_edit_locked(not self.analysis_edit_locked)
@@ -3089,23 +3539,7 @@ class MainWindow(QMainWindow):
 
     def _refresh_analysis_summary(self) -> None:
         lock_text = "已锁定" if self.analysis_edit_locked else "可编辑"
-        if self.algorithm_combo.currentData() == "iud_intrapulse_v1":
-            f0_text = "自动 f0" if self.iud_fixed_f0_spin.value() <= 0 else f"f0 {self.iud_fixed_f0_spin.value():.3f} MHz"
-            summary = (
-                f"{self.algorithm_combo.currentText()} | {lock_text} | {self.iud_window_count_spin.value()} 窗 | "
-                f"UH {self.iud_orders_edit.text().strip()} | AUC ±{self.iud_auc_half_width_spin.value():.1f} kHz | "
-                f"阈值 {self.iud_threshold_spin.value():.1f} dB | {f0_text}"
-            )
-        else:
-            summary = (
-                f"{self.algorithm_combo.currentText()} | {lock_text} | "
-                f"{self.spectrum_mode_combo.currentText()} | {self.segment_count_spin.value()} 段 | "
-                f"峰/噪/宽 {self.peak_half_width_spin.value():.1f}/{self.noise_half_width_spin.value():.1f}/"
-                f"{self.broadband_half_width_spin.value():.1f} kHz | "
-                f"阶次 {self.order_range_low_spin.value():.2f}~{self.order_range_high_spin.value():.2f} | "
-                f"峰阈 {self.peak_prominence_spin.value():.1f} dB"
-            )
-        self.analysis_summary_label.setText(summary)
+        self.analysis_summary_label.setText(f"{self.algorithm_combo.currentText()} | {lock_text}")
 
     def _apply_settings_to_ui(self, settings: AppSettings) -> None:
         self.mode_combo.setCurrentIndex(0 if settings.ui.last_mode == "playback" else 1)
@@ -3122,6 +3556,17 @@ class MainWindow(QMainWindow):
         self.timeout_spin.setValue(settings.hardware.timeout_seconds)
         self.save_csv_check.setChecked(settings.hardware.save_csv)
         self.output_dir_edit.setText(settings.hardware.output_dir)
+        self.signal_resource_combo.setCurrentText(settings.signal_generator.resource_name)
+        self.signal_timeout_spin.setValue(settings.signal_generator.timeout_ms)
+        channel_index = self.signal_channel_combo.findData(settings.signal_generator.channel)
+        self.signal_channel_combo.setCurrentIndex(max(channel_index, 0))
+        self.signal_frequency_spin.setValue(settings.signal_generator.frequency_hz)
+        self.signal_amplitude_spin.setValue(settings.signal_generator.amplitude_vpp)
+        load_index = self.signal_load_combo.findData(settings.signal_generator.load)
+        self.signal_load_combo.setCurrentIndex(max(load_index, 0))
+        self.signal_prf_spin.setValue(settings.signal_generator.prf_hz)
+        self.signal_cycles_spin.setValue(settings.signal_generator.burst_cycles)
+        self._refresh_signal_generator_summary()
         algorithm_index = self.algorithm_combo.findData(settings.analysis.algorithm_id)
         self.algorithm_combo.setCurrentIndex(max(algorithm_index, 0))
         self.reference_no_edit.setText(join_patterns(settings.reference.no_cavitation_patterns))
@@ -3147,6 +3592,9 @@ class MainWindow(QMainWindow):
         self.max_live_points_spin.setValue(settings.ui.max_live_points)
         self.show_reference_points_check.setChecked(settings.ui.show_reference_points)
         self.scatter_widget.set_show_reference_points(settings.ui.show_reference_points)
+        self._set_hardware_section_expanded(settings.ui.hardware_section_expanded)
+        self._set_signal_generator_section_expanded(settings.ui.signal_generator_section_expanded)
+        self._set_analysis_section_expanded(settings.ui.analysis_section_expanded)
         self._set_playback_ui_state(PlaybackUiState())
 
     def _collect_settings_from_ui(self) -> AppSettings:
@@ -3189,6 +3637,17 @@ class MainWindow(QMainWindow):
                 save_csv=self.save_csv_check.isChecked(),
                 output_dir=self.output_dir_edit.text().strip(),
             ),
+            signal_generator=SignalGeneratorSettings(
+                resource_name=self.signal_resource_combo.currentText().strip(),
+                timeout_ms=self.signal_timeout_spin.value(),
+                channel=self.signal_channel_combo.currentData(),
+                frequency_hz=self.signal_frequency_spin.value(),
+                amplitude_vpp=self.signal_amplitude_spin.value(),
+                offset_v=0.0,
+                load=self.signal_load_combo.currentData(),
+                prf_hz=self.signal_prf_spin.value(),
+                burst_cycles=self.signal_cycles_spin.value(),
+            ),
             playback=PlaybackSettings(
                 source_patterns=split_patterns(self.playback_source_edit.text()),
                 interval_ms=self.playback_interval_spin.value(),
@@ -3204,6 +3663,9 @@ class MainWindow(QMainWindow):
                 last_mode=self.mode_combo.currentData(),
                 max_live_points=self.max_live_points_spin.value(),
                 show_reference_points=self.show_reference_points_check.isChecked(),
+                hardware_section_expanded=self.hardware_section_expanded,
+                signal_generator_section_expanded=self.signal_generator_section_expanded,
+                analysis_section_expanded=self.analysis_section_expanded,
             ),
         )
 
@@ -3211,6 +3673,7 @@ class MainWindow(QMainWindow):
         is_hardware = self.mode_combo.currentData() == "hardware"
         self.playback_group.setEnabled(not is_hardware)
         self.hardware_group.setEnabled(is_hardware)
+        self.signal_generator_group.setEnabled(is_hardware)
         self._set_playback_ui_state(self.playback_state)
 
     def _set_playback_ui_state(self, state: PlaybackUiState) -> None:
@@ -3302,6 +3765,124 @@ class MainWindow(QMainWindow):
         )
         if selected_dir:
             self.output_dir_edit.setText(make_portable_path(Path(selected_dir)))
+
+    def _refresh_signal_generator_summary(self) -> None:
+        frequency_hz = self.signal_frequency_spin.value()
+        prf_hz = self.signal_prf_spin.value()
+        cycles = self.signal_cycles_spin.value()
+        if frequency_hz <= 0:
+            self.signal_duty_label.setText("-")
+            return
+        pulse_seconds = cycles / frequency_hz
+        duty_percent = pulse_seconds * prf_hz * 100.0
+        self.signal_duty_label.setText(
+            f"{duty_percent:.3g}%（脉冲 {pulse_seconds * 1e3:.3g} ms，周期 {1.0 / prf_hz:.3g} s）"
+        )
+
+    def _scan_signal_generator_resources(self) -> None:
+        try:
+            resources = self.signal_generator_client.list_resources()
+        except Exception as exc:
+            QMessageBox.critical(self, "信号发生器扫描失败", str(exc))
+            self.append_log(f"Signal generator scan failed: {exc}")
+            return
+
+        current_text = self.signal_resource_combo.currentText().strip()
+        self.signal_resource_combo.clear()
+        self.signal_resource_combo.addItems(resources)
+        preferred = next((item for item in resources if item.startswith("USB")), "")
+        target = current_text if current_text in resources else preferred
+        if target:
+            self.signal_resource_combo.setCurrentText(target)
+        self.append_log(f"Signal generator resources: {', '.join(resources) if resources else 'none'}")
+
+    def _connect_signal_generator(self) -> None:
+        try:
+            identity = self.signal_generator_client.connect(
+                self.signal_resource_combo.currentText(),
+                self.signal_timeout_spin.value(),
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "信号发生器连接失败", str(exc))
+            self.append_log(f"Signal generator connect failed: {exc}")
+            return
+        self.signal_identity_label.setText(identity)
+        self.append_log(f"Signal generator connected: {identity}")
+        if "DG1062" not in identity.upper():
+            QMessageBox.warning(
+                self,
+                "型号提醒",
+                "已经连接到 VISA 仪器，但身份返回里没有 DG1062。请确认选中的是 RIGOL 信号发生器。",
+            )
+
+    def _disconnect_signal_generator(self) -> None:
+        self.signal_generator_client.disconnect()
+        self.signal_identity_label.setText("未连接")
+        self.append_log("Signal generator disconnected.")
+
+    def _signal_generator_channel(self) -> int:
+        return int(self.signal_channel_combo.currentData())
+
+    def _apply_signal_generator_settings(self) -> None:
+        try:
+            self.signal_generator_client.configure_burst_sine(
+                channel=self._signal_generator_channel(),
+                frequency_hz=self.signal_frequency_spin.value(),
+                amplitude_vpp=self.signal_amplitude_spin.value(),
+                offset_v=0.0,
+                load=self.signal_load_combo.currentData(),
+                prf_hz=self.signal_prf_spin.value(),
+                burst_cycles=self.signal_cycles_spin.value(),
+            )
+            error_text = self.signal_generator_client.query_error()
+        except Exception as exc:
+            self.append_log(f"Signal generator configure failed: {exc}")
+            self.statusBar().showMessage("Signal generator configure failed")
+            return
+
+        if error_text.startswith("0"):
+            result_text = f"SYST:ERR? {error_text}"
+        else:
+            result_text = f"SYST:ERR? {error_text}"
+            self.statusBar().showMessage("Signal generator reported an SCPI error")
+
+        self.append_log(
+            "Signal generator configured: "
+            f"CH{self._signal_generator_channel()}, "
+            f"{self.signal_frequency_spin.value():.12g} Hz, "
+            f"{self.signal_amplitude_spin.value():.12g} Vpp, "
+            f"PRF {self.signal_prf_spin.value():.12g} Hz, "
+            f"{self.signal_cycles_spin.value()} cycles. "
+            f"Output remains OFF. {result_text}"
+        )
+
+    def _set_signal_generator_output(self, enabled: bool) -> None:
+        channel = self._signal_generator_channel()
+        if enabled:
+            answer = QMessageBox.question(
+                self,
+                "确认打开输出",
+                f"即将打开 CH{channel} 输出。\n\n请确认功放/换能器连接和电压设置安全。",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return
+        try:
+            self.signal_generator_client.set_output(channel, enabled)
+            state = self.signal_generator_client.query("OUTP?" if channel == 1 else "OUTP:CH2?")
+        except Exception as exc:
+            QMessageBox.critical(self, "信号发生器输出控制失败", str(exc))
+            self.append_log(f"Signal generator output control failed: {exc}")
+            return
+        self.append_log(f"Signal generator CH{channel} output {'ON' if enabled else 'OFF'}; query returned {state}.")
+
+    def _open_scpi_console(self) -> None:
+        if not self.signal_generator_client.connected:
+            QMessageBox.warning(self, "尚未连接", "请先连接信号发生器，再打开 SCPI 控制台。")
+            return
+        self.scpi_console_dialog = ScpiConsoleDialog(self.signal_generator_client, self)
+        self.scpi_console_dialog.show()
 
     def _clear_live_points(self) -> None:
         self.scatter_widget.clear_live_results()
@@ -3459,6 +4040,7 @@ class MainWindow(QMainWindow):
         if self.worker_thread is not None:
             self.worker_thread.quit()
             self.worker_thread.wait(1500)
+        self.signal_generator_client.close()
         event.accept()
 
 
