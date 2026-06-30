@@ -4374,7 +4374,7 @@ class MainWindow(QMainWindow):
                 border: 1px solid {border};
                 border-radius: 5px;
                 padding: 4px 10px;
-                font-weight: 600;
+                font-weight: bold;
             }}
             QPushButton:hover {{
                 border: 1px solid #111827;
@@ -4394,7 +4394,7 @@ class MainWindow(QMainWindow):
         return (
             f"QLabel {{ background-color: {background}; color: {foreground}; "
             f"border: 1px solid {border}; border-radius: 8px; "
-            "padding: 3px 8px; font-weight: 700; }}"
+            "padding: 3px 8px; font-weight: bold; }}"
         )
 
     def _apply_visual_theme(self) -> None:
@@ -4404,7 +4404,7 @@ class MainWindow(QMainWindow):
                 border-radius: 8px;
                 margin-top: 8px;
                 background-color: #f8fafc;
-                font-weight: 700;
+                font-weight: bold;
             }
             QGroupBox::title {
                 subcontrol-origin: margin;
@@ -4438,7 +4438,7 @@ class MainWindow(QMainWindow):
         self.clear_button.setStyleSheet(self._button_style("#64748b", "#475569"))
         self.import_settings_button.setStyleSheet(self._button_style("#f3f4f6", "#cbd5e1", "#1f2937"))
         self.export_settings_button.setStyleSheet(self._button_style("#f3f4f6", "#cbd5e1", "#1f2937"))
-        self.hardware_status_label.setStyleSheet("color: #475569; font-weight: 600;")
+        self.hardware_status_label.setStyleSheet("color: #475569; font-weight: bold;")
 
     def _set_signal_connection_visual(self, connected: bool) -> None:
         if connected:
@@ -5369,11 +5369,22 @@ def save_app_settings(settings: AppSettings) -> None:
 
 
 def load_app_settings_from_path(config_path: Path) -> AppSettings:
-    with config_path.open("r", encoding="utf-8") as handle:
-        data = json.load(handle)
-    if not isinstance(data, dict):
-        raise ValueError("设置文件格式不正确：顶层内容不是 JSON 对象。")
-    return AppSettings.from_dict(data)
+    try:
+        with config_path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        if not isinstance(data, dict):
+            raise ValueError("设置文件格式不正确：顶层内容不是 JSON 对象。")
+        return AppSettings.from_dict(data)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_path = config_path.with_name(f"{config_path.name}.invalid-{timestamp}")
+        try:
+            config_path.replace(backup_path)
+        except OSError:
+            pass
+        settings = AppSettings()
+        save_app_settings_to_path(settings, config_path)
+        return settings
 
 
 def save_app_settings_to_path(settings: AppSettings, config_path: Path) -> None:
