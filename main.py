@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Iterable
 
 import numpy as np
-from PyQt5.QtCore import QObject, Qt, QThread, pyqtSignal, pyqtSlot
+from PyQt5.QtCore import QObject, QRect, Qt, QThread, pyqtSignal, pyqtSlot
 from PyQt5.QtGui import QColor, QPainter, QPen
 from PyQt5.QtWidgets import (
     QApplication,
@@ -36,6 +36,7 @@ from PyQt5.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSpinBox,
@@ -64,6 +65,97 @@ class WheelSafeDoubleSpinBox(QDoubleSpinBox):
 QComboBox = WheelSafeComboBox
 QSpinBox = WheelSafeSpinBox
 QDoubleSpinBox = WheelSafeDoubleSpinBox
+
+
+class RangeSlider(QWidget):
+    rangeChanged = pyqtSignal(int, int)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.minimum = 1
+        self.maximum = 1
+        self.lower_value = 1
+        self.upper_value = 1
+        self._active_handle: str | None = None
+        self.setMinimumHeight(30)
+        self.setMinimumWidth(140)
+
+    def setRange(self, minimum: int, maximum: int) -> None:
+        minimum = max(1, int(minimum))
+        maximum = max(minimum, int(maximum))
+        self.minimum = minimum
+        self.maximum = maximum
+        self.setValues(self.lower_value, self.upper_value, emit_signal=False)
+
+    def setValues(self, lower: int, upper: int, emit_signal: bool = True) -> None:
+        lower = min(max(int(lower), self.minimum), self.maximum)
+        upper = min(max(int(upper), self.minimum), self.maximum)
+        if lower > upper:
+            lower, upper = upper, lower
+        changed = lower != self.lower_value or upper != self.upper_value
+        self.lower_value = lower
+        self.upper_value = upper
+        self.update()
+        if changed and emit_signal:
+            self.rangeChanged.emit(self.lower_value, self.upper_value)
+
+    def _track_rect(self) -> QRect:
+        return self.rect().adjusted(12, 11, -12, -11)
+
+    def _value_to_x(self, value: int) -> int:
+        track = self._track_rect()
+        if self.maximum <= self.minimum:
+            return track.left()
+        ratio = (value - self.minimum) / (self.maximum - self.minimum)
+        return int(track.left() + ratio * track.width())
+
+    def _x_to_value(self, x_pos: int) -> int:
+        track = self._track_rect()
+        if self.maximum <= self.minimum or track.width() <= 0:
+            return self.minimum
+        ratio = (x_pos - track.left()) / track.width()
+        ratio = min(max(ratio, 0.0), 1.0)
+        return int(round(self.minimum + ratio * (self.maximum - self.minimum)))
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        track = self._track_rect()
+        center_y = track.center().y()
+        painter.setPen(QPen(QColor("#cbd5e1"), 4, Qt.SolidLine, Qt.RoundCap))
+        painter.drawLine(track.left(), center_y, track.right(), center_y)
+
+        lower_x = self._value_to_x(self.lower_value)
+        upper_x = self._value_to_x(self.upper_value)
+        painter.setPen(QPen(QColor("#2563eb"), 5, Qt.SolidLine, Qt.RoundCap))
+        painter.drawLine(lower_x, center_y, upper_x, center_y)
+
+        for x_pos in (lower_x, upper_x):
+            painter.setBrush(QColor("#ffffff"))
+            painter.setPen(QPen(QColor("#1d4ed8"), 2))
+            painter.drawEllipse(x_pos - 7, center_y - 7, 14, 14)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() != Qt.LeftButton:
+            return
+        lower_x = self._value_to_x(self.lower_value)
+        upper_x = self._value_to_x(self.upper_value)
+        self._active_handle = "lower" if abs(event.x() - lower_x) <= abs(event.x() - upper_x) else "upper"
+        self._move_active_handle(event.x())
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._active_handle:
+            self._move_active_handle(event.x())
+
+    def mouseReleaseEvent(self, event) -> None:
+        self._active_handle = None
+
+    def _move_active_handle(self, x_pos: int) -> None:
+        value = self._x_to_value(x_pos)
+        if self._active_handle == "lower":
+            self.setValues(min(value, self.upper_value), self.upper_value)
+        elif self._active_handle == "upper":
+            self.setValues(self.lower_value, max(value, self.lower_value))
 
 
 ACTS1000_INPUT_N5000_P5000mV = 0x00
@@ -231,6 +323,23 @@ class PlaybackSettings:
 
 
 @dataclass
+class ContrastSettings:
+    source_patterns: list[str] = field(default_factory=lambda: ["data/playback/*.csv"])
+    recursive: bool = False
+    max_files_per_group: int = 0
+    show_reference_background: bool = True
+    last_browse_dir: str = ""
+
+
+@dataclass
+class ContrastSourceSpec:
+    pattern: str
+    start_index: int = 1
+    end_index: int = 0
+    group_name: str = ""
+
+
+@dataclass
 class ReferenceSettings:
     no_cavitation_patterns: list[str] = field(
         default_factory=lambda: ["data/reference/no_cavitation/*.csv"]
@@ -351,6 +460,7 @@ class AppSettings:
     hardware: HardwareSettings = field(default_factory=HardwareSettings)
     signal_generator: SignalGeneratorSettings = field(default_factory=SignalGeneratorSettings)
     playback: PlaybackSettings = field(default_factory=PlaybackSettings)
+    contrast: ContrastSettings = field(default_factory=ContrastSettings)
     reference: ReferenceSettings = field(default_factory=ReferenceSettings)
     analysis: AnalysisSettings = field(default_factory=AnalysisSettings)
     iud: IudSettings = field(default_factory=IudSettings)
@@ -365,6 +475,7 @@ class AppSettings:
             hardware=HardwareSettings(**data.get("hardware", {})),
             signal_generator=SignalGeneratorSettings(**data.get("signal_generator", {})),
             playback=PlaybackSettings(**data.get("playback", {})),
+            contrast=ContrastSettings(**data.get("contrast", {})),
             reference=ReferenceSettings(**data.get("reference", {})),
             analysis=AnalysisSettings.from_dict(data.get("analysis", {})),
             iud=IudSettings(**data.get("iud", {})),
@@ -738,6 +849,24 @@ class PlaybackUiState:
 
 
 @dataclass
+class ContrastPoint:
+    metrics: PcdMetrics
+    group_name: str
+    file_name: str
+    relative_path: str
+    sequence_index: int
+
+
+@dataclass
+class ContrastProgress:
+    current: int = 0
+    total: int = 0
+    current_group: str = ""
+    current_file: str = ""
+    skipped: int = 0
+
+
+@dataclass
 class CaptureResult:
     raw_codes: np.ndarray
     voltage_mv: np.ndarray
@@ -1077,6 +1206,116 @@ def resolve_input_patterns(patterns: list[str]) -> list[Path]:
     return deduplicated
 
 
+def parse_contrast_index(raw_text: str, default: int | None, allow_open_end: bool = False) -> int | None:
+    text = raw_text.strip()
+    if not text:
+        return default
+    if allow_open_end and text.lower() in {"不限", "全部", "all", "end", "last", "*"}:
+        return None
+    value = int(text)
+    if value < 1:
+        raise ValueError("Contrast point indices are 1-based and must be positive.")
+    return value
+
+
+def parse_contrast_source_spec(raw_line: str) -> ContrastSourceSpec:
+    group_name = ""
+    line = raw_line.strip()
+    if "||" in line:
+        group_name, line = [part.strip() for part in line.split("||", 1)]
+
+    parts = [part.strip() for part in line.split("|")]
+    pattern = parts[0] if parts else ""
+    if not pattern:
+        raise ValueError("Contrast source path is empty.")
+
+    start_index = 1
+    end_index = 0
+    if len(parts) >= 3:
+        start_index = parse_contrast_index(parts[1], default=1) or 1
+        parsed_end = parse_contrast_index(parts[2], default=None, allow_open_end=True)
+        end_index = int(parsed_end) if parsed_end is not None else 0
+    elif len(parts) == 2 and parts[1]:
+        range_text = parts[1].replace("：", ":").replace("～", "-").replace("—", "-").replace("–", "-")
+        separator = next((candidate for candidate in ("-", ":", "~") if candidate in range_text), "")
+        if separator:
+            start_text, end_text = range_text.split(separator, 1)
+            start_index = parse_contrast_index(start_text, default=1) or 1
+            parsed_end = parse_contrast_index(end_text, default=None, allow_open_end=True)
+            end_index = int(parsed_end) if parsed_end is not None else 0
+        else:
+            start_index = parse_contrast_index(range_text, default=1) or 1
+
+    if end_index and end_index < start_index:
+        raise ValueError(f"Contrast range end ({end_index}) is smaller than start ({start_index}): {raw_line}")
+    return ContrastSourceSpec(pattern=pattern, start_index=start_index, end_index=end_index, group_name=group_name)
+
+
+def format_contrast_source_spec(spec: ContrastSourceSpec) -> str:
+    end_text = str(spec.end_index) if spec.end_index > 0 else ""
+    prefix = f"{spec.group_name.strip()} || " if spec.group_name.strip() else ""
+    return f"{prefix}{spec.pattern.strip()} | {max(1, spec.start_index)} | {end_text}"
+
+
+def find_contrast_candidate_files(pattern: str, recursive: bool = False) -> tuple[str, list[Path]]:
+    resolved = resolve_workspace_path(pattern)
+    if resolved.exists() and resolved.is_dir():
+        group_name = resolved.name or str(resolved)
+        found = sorted(resolved.rglob("*.csv") if recursive else resolved.glob("*.csv"))
+    elif resolved.exists() and resolved.is_file():
+        group_name = resolved.parent.name or resolved.stem
+        found = [resolved]
+    else:
+        found = [Path(match).resolve() for match in sorted(glob.glob(str(resolved), recursive=recursive))]
+        static_base = reference_pattern_base_directory([pattern])
+        group_name = static_base.name or pattern
+
+    deduplicated: list[Path] = []
+    seen: set[str] = set()
+    for file_path in found:
+        if not file_path.exists() or not file_path.is_file() or file_path.suffix.lower() != ".csv":
+            continue
+        key = str(file_path.resolve()).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduplicated.append(file_path.resolve())
+    return group_name, deduplicated
+
+
+def resolve_contrast_sources(
+    patterns: list[str],
+    recursive: bool = False,
+    max_files_per_group: int = 0,
+) -> list[tuple[str, list[Path]]]:
+    groups: list[tuple[str, list[Path]]] = []
+    used_names: dict[str, int] = {}
+
+    for raw_pattern in patterns:
+        raw_pattern = raw_pattern.strip()
+        if not raw_pattern:
+            continue
+        spec = parse_contrast_source_spec(raw_pattern)
+        default_group_name, deduplicated = find_contrast_candidate_files(spec.pattern, recursive=recursive)
+
+        start_offset = spec.start_index - 1
+        end_offset = spec.end_index if spec.end_index > 0 else None
+        selected = deduplicated[start_offset:end_offset]
+        if max_files_per_group > 0:
+            selected = selected[:max_files_per_group]
+
+        if not selected:
+            continue
+
+        base_name = spec.group_name.strip() or default_group_name.strip() or f"Group {len(groups) + 1}"
+        count = used_names.get(base_name, 0)
+        used_names[base_name] = count + 1
+        display_name = base_name if count == 0 else f"{base_name} #{count + 1}"
+        groups.append((display_name, selected))
+
+    return groups
+
+
 def relative_to_workspace(path: Path | None) -> str:
     if path is None:
         return ""
@@ -1085,7 +1324,48 @@ def relative_to_workspace(path: Path | None) -> str:
     except ValueError:
         return str(path.resolve())
 
+
+def try_load_standard_capture_csv(file_path: Path, target_sample_count: int) -> tuple[np.ndarray, float | None] | None:
+    try:
+        with file_path.open("r", encoding="utf-8-sig", newline="") as csv_file:
+            header = csv_file.readline().strip().lower().replace(" ", "")
+    except UnicodeDecodeError:
+        return None
+
+    if header != "sample_index,raw_code,voltage_mv,sample_rate_hz":
+        return None
+
+    try:
+        loaded = np.loadtxt(
+            file_path,
+            delimiter=",",
+            skiprows=1,
+            usecols=(2, 3),
+            max_rows=target_sample_count,
+            dtype=float,
+            encoding="utf-8-sig",
+        )
+    except Exception:
+        return None
+
+    loaded = np.asarray(loaded, dtype=float)
+    if loaded.ndim == 1:
+        loaded = loaded.reshape(1, -1)
+    if loaded.shape[0] < target_sample_count:
+        raise ValueError(f"Signal is shorter than {target_sample_count} points: {file_path}")
+    signal = loaded[:target_sample_count, 0]
+    signal = signal[np.isfinite(signal)]
+    if signal.size < target_sample_count:
+        raise ValueError(f"Signal contains non-finite samples before {target_sample_count} points: {file_path}")
+    sample_rate_hz = float(loaded[0, 1]) if loaded.shape[1] > 1 and math.isfinite(float(loaded[0, 1])) else None
+    return signal, sample_rate_hz
+
+
 def load_signal_csv(file_path: Path, target_sample_count: int) -> tuple[np.ndarray, float | None]:
+    fast_result = try_load_standard_capture_csv(file_path, target_sample_count)
+    if fast_result is not None:
+        return fast_result
+
     text = file_path.read_text(encoding="utf-8-sig")
     rows = [row for row in csv.reader(text.splitlines()) if row and any(cell.strip() for cell in row)]
     if not rows:
@@ -2466,10 +2746,462 @@ class PcdScatterWidget(QWidget):
         painter.drawText(base_x, scale_top + 24, "Background: no cav")
         painter.drawText(base_x + 86, scale_top + 24, "cav")
 
+
+class PcdContrastWidget(QWidget):
+    PALETTE = [
+        "#2563eb",
+        "#dc2626",
+        "#16a34a",
+        "#9333ea",
+        "#ea580c",
+        "#0891b2",
+        "#be123c",
+        "#4f46e5",
+        "#65a30d",
+        "#a16207",
+    ]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.no_results: list[PcdMetrics] = []
+        self.cav_results: list[PcdMetrics] = []
+        self.group_results: dict[str, list[PcdMetrics]] = {}
+        self.show_reference_background = True
+        self.setMinimumHeight(520)
+        self.setStyleSheet("background: white;")
+
+    def set_reference_results(self, no_results: list[PcdMetrics], cav_results: list[PcdMetrics]) -> None:
+        self.no_results = no_results
+        self.cav_results = cav_results
+        self.update()
+
+    def set_show_reference_background(self, enabled: bool) -> None:
+        self.show_reference_background = bool(enabled)
+        self.update()
+
+    def clear_results(self) -> None:
+        self.group_results = {}
+        self.update()
+
+    def add_point(self, point: ContrastPoint) -> None:
+        self.group_results.setdefault(point.group_name, []).append(point.metrics)
+        self.update()
+
+    def summary_text(self) -> str:
+        if not self.group_results:
+            return "尚未生成对比结果。"
+        parts = []
+        total = 0
+        for group_name, results in self.group_results.items():
+            total += len(results)
+            if results:
+                scores = [result.cavitation_score for result in results if math.isfinite(result.cavitation_score)]
+                score_text = f"，平均 Score {float(np.mean(scores)):.3f}" if scores else ""
+                parts.append(f"{group_name}: {len(results)} 点{score_text}")
+        return f"共 {len(self.group_results)} 组，{total} 点。 " + "； ".join(parts)
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.fillRect(self.rect(), QColor("#ffffff"))
+
+        chart_rect = self.rect().adjusted(78, 32, -210, -66)
+        legend_rect = self.rect().adjusted(self.width() - 190, 36, -16, -24)
+        painter.setPen(QPen(QColor("#d0d7de"), 1))
+        painter.drawRect(chart_rect)
+
+        grouped_points = [
+            metrics.plot_coordinates()
+            for results in self.group_results.values()
+            for metrics in results
+        ]
+        points = list(grouped_points)
+        if points:
+            x_values = [point[0] for point in points]
+            y_values = [point[1] for point in points]
+            for results in self.group_results.values():
+                if len(results) <= 1:
+                    continue
+                group_points = np.asarray([metrics.plot_coordinates() for metrics in results], dtype=float)
+                center = np.mean(group_points, axis=0)
+                spread = np.std(group_points, axis=0)
+                x_values.extend([float(center[0] - spread[0]), float(center[0] + spread[0])])
+                y_values.extend([float(center[1] - spread[1]), float(center[1] + spread[1])])
+            x_min, x_max = min(x_values), max(x_values)
+            y_min, y_max = min(y_values), max(y_values)
+        else:
+            x_min = y_min = -6.0
+            x_max = y_max = 0.0
+
+        minimum_span = 0.18 if grouped_points else 0.5
+        if abs(x_max - x_min) < minimum_span:
+            center = (x_min + x_max) / 2
+            x_min = center - minimum_span / 2
+            x_max = center + minimum_span / 2
+        if abs(y_max - y_min) < minimum_span:
+            center = (y_min + y_max) / 2
+            y_min = center - minimum_span / 2
+            y_max = center + minimum_span / 2
+
+        x_pad = max(0.04 if grouped_points else 0.2, (x_max - x_min) * 0.12)
+        y_pad = max(0.04 if grouped_points else 0.2, (y_max - y_min) * 0.12)
+        x_min -= x_pad
+        x_max += x_pad
+        y_min -= y_pad
+        y_max += y_pad
+
+        def to_pixel(x_value: float, y_value: float) -> tuple[float, float]:
+            x_ratio = (x_value - x_min) / max(x_max - x_min, FLOAT_EPS)
+            y_ratio = (y_value - y_min) / max(y_max - y_min, FLOAT_EPS)
+            return (
+                chart_rect.left() + x_ratio * chart_rect.width(),
+                chart_rect.bottom() - y_ratio * chart_rect.height(),
+            )
+
+        if self.show_reference_background:
+            self._draw_reference_background(painter, chart_rect, x_min, x_max, y_min, y_max)
+
+        tick_count = 5
+        painter.setPen(QPen(QColor("#e5e7eb"), 1, Qt.DashLine))
+        for tick_index in range(tick_count + 1):
+            x_ratio = tick_index / tick_count
+            y_ratio = tick_index / tick_count
+            x_pixel = chart_rect.left() + x_ratio * chart_rect.width()
+            y_pixel = chart_rect.bottom() - y_ratio * chart_rect.height()
+            painter.drawLine(int(x_pixel), chart_rect.top(), int(x_pixel), chart_rect.bottom())
+            painter.drawLine(chart_rect.left(), int(y_pixel), chart_rect.right(), int(y_pixel))
+
+        painter.setPen(QPen(QColor("#111827"), 1))
+        for tick_index in range(tick_count + 1):
+            x_ratio = tick_index / tick_count
+            y_ratio = tick_index / tick_count
+            x_value = x_min + x_ratio * (x_max - x_min)
+            y_value = y_min + y_ratio * (y_max - y_min)
+            x_pixel = chart_rect.left() + x_ratio * chart_rect.width()
+            y_pixel = chart_rect.bottom() - y_ratio * chart_rect.height()
+            painter.drawText(int(x_pixel) - 18, chart_rect.bottom() + 20, f"{x_value:.1f}")
+            painter.drawText(12, int(y_pixel) + 5, f"{y_value:.1f}")
+
+        painter.drawText(chart_rect.center().x() - 88, self.height() - 22, "log10(SCDultra)")
+        painter.drawText(12, 20, "log10(ICD)")
+        painter.drawText(chart_rect.left(), 22, "Contrast Mode: grouped SCD–ICD scatter")
+
+        for group_index, (group_name, results) in enumerate(self.group_results.items()):
+            color = QColor(self.PALETTE[group_index % len(self.PALETTE)])
+            self._draw_group(painter, group_name, results, to_pixel, color)
+
+        self._draw_legend(painter, legend_rect)
+
+        if not self.group_results:
+            painter.setPen(QPen(QColor("#64748b"), 1))
+            painter.drawText(chart_rect.adjusted(12, 16, -12, -16), Qt.AlignCenter, "进入 Contrast 对比模式，选择多个路径后点击开始。")
+
+    def _draw_reference_background(
+        self,
+        painter: QPainter,
+        chart_rect,
+        x_min: float,
+        x_max: float,
+        y_min: float,
+        y_max: float,
+    ) -> None:
+        if not self.no_results or not self.cav_results:
+            return
+        no_points = np.asarray([metrics.plot_coordinates() for metrics in self.no_results], dtype=float)
+        cav_points = np.asarray([metrics.plot_coordinates() for metrics in self.cav_results], dtype=float)
+        cols = max(24, min(52, chart_rect.width()))
+        rows = max(24, min(52, chart_rect.height()))
+        x_centers = np.linspace(x_min, x_max, cols, dtype=float)
+        y_centers = np.linspace(y_max, y_min, rows, dtype=float)
+        grid_x, grid_y = np.meshgrid(x_centers, y_centers)
+        bandwidth_x = max(SCATTER_BACKGROUND_MIN_BANDWIDTH, (x_max - x_min) * 0.16)
+        bandwidth_y = max(SCATTER_BACKGROUND_MIN_BANDWIDTH, (y_max - y_min) * 0.16)
+        no_density = self._compute_class_density(grid_x, grid_y, no_points, bandwidth_x, bandwidth_y)
+        cav_density = self._compute_class_density(grid_x, grid_y, cav_points, bandwidth_x, bandwidth_y)
+        total_density = no_density + cav_density
+        peak_density = float(np.max(total_density))
+        if peak_density <= FLOAT_EPS:
+            return
+        cav_probability = cav_density / np.maximum(total_density, FLOAT_EPS)
+        density_strength = np.sqrt(np.clip(total_density / peak_density, 0.0, 1.0))
+        x_edges = np.linspace(chart_rect.left(), chart_rect.left() + chart_rect.width(), cols + 1)
+        y_edges = np.linspace(chart_rect.top(), chart_rect.top() + chart_rect.height(), rows + 1)
+        low_color = np.asarray((219, 234, 254), dtype=float)
+        high_color = np.asarray((254, 226, 226), dtype=float)
+        for row in range(rows):
+            top = int(math.floor(y_edges[row]))
+            bottom = int(math.ceil(y_edges[row + 1]))
+            for col in range(cols):
+                probability = float(cav_probability[row, col])
+                base_rgb = low_color * (1.0 - probability) + high_color * probability
+                alpha = int(18 + 96 * float(density_strength[row, col]))
+                left = int(math.floor(x_edges[col]))
+                right = int(math.ceil(x_edges[col + 1]))
+                painter.fillRect(
+                    left,
+                    top,
+                    max(1, right - left),
+                    max(1, bottom - top),
+                    QColor(int(base_rgb[0]), int(base_rgb[1]), int(base_rgb[2]), alpha),
+                )
+
+    def _compute_class_density(
+        self,
+        grid_x: np.ndarray,
+        grid_y: np.ndarray,
+        points: np.ndarray,
+        bandwidth_x: float,
+        bandwidth_y: float,
+    ) -> np.ndarray:
+        dx = (grid_x[..., None] - points[:, 0]) / max(bandwidth_x, FLOAT_EPS)
+        dy = (grid_y[..., None] - points[:, 1]) / max(bandwidth_y, FLOAT_EPS)
+        return np.mean(np.exp(-0.5 * (dx * dx + dy * dy)), axis=2)
+
+    def _draw_group(self, painter: QPainter, group_name: str, results: list[PcdMetrics], mapper, color: QColor) -> None:
+        if not results:
+            return
+        points = np.asarray([metrics.plot_coordinates() for metrics in results], dtype=float)
+        point_color = QColor(color)
+        point_color.setAlpha(105)
+        painter.setPen(QPen(QColor(color.red(), color.green(), color.blue(), 150), 1))
+        painter.setBrush(point_color)
+        for x_value, y_value in points:
+            x_pixel, y_pixel = mapper(float(x_value), float(y_value))
+            painter.drawEllipse(int(x_pixel) - 3, int(y_pixel) - 3, 6, 6)
+
+        center = np.mean(points, axis=0)
+        spread = np.std(points, axis=0) if len(points) > 1 else np.asarray([0.08, 0.08], dtype=float)
+        left_top = mapper(float(center[0] - spread[0]), float(center[1] + spread[1]))
+        right_bottom = mapper(float(center[0] + spread[0]), float(center[1] - spread[1]))
+        width = max(12, int(abs(right_bottom[0] - left_top[0])))
+        height = max(12, int(abs(right_bottom[1] - left_top[1])))
+        painter.setBrush(QColor(color.red(), color.green(), color.blue(), 24))
+        painter.setPen(QPen(color, 2, Qt.DashLine))
+        painter.drawEllipse(int(min(left_top[0], right_bottom[0])), int(min(left_top[1], right_bottom[1])), width, height)
+
+        center_x, center_y = mapper(float(center[0]), float(center[1]))
+        painter.setBrush(color)
+        painter.setPen(QPen(QColor("#0f172a"), 2))
+        painter.drawEllipse(int(center_x) - 7, int(center_y) - 7, 14, 14)
+        painter.setPen(QPen(QColor("#111827"), 1))
+        painter.drawText(int(center_x) + 10, int(center_y) - 8, group_name)
+
+    def _draw_legend(self, painter: QPainter, legend_rect) -> None:
+        painter.setPen(QPen(QColor("#cbd5e1"), 1))
+        painter.setBrush(QColor("#f8fafc"))
+        painter.drawRoundedRect(legend_rect, 8, 8)
+        painter.setPen(QPen(QColor("#0f172a"), 1))
+        painter.drawText(legend_rect.left() + 10, legend_rect.top() + 22, "Groups")
+        y = legend_rect.top() + 44
+        for group_index, (group_name, results) in enumerate(self.group_results.items()):
+            if y > legend_rect.bottom() - 18:
+                painter.drawText(legend_rect.left() + 10, y, "...")
+                break
+            color = QColor(self.PALETTE[group_index % len(self.PALETTE)])
+            painter.setBrush(color)
+            painter.setPen(QPen(Qt.NoPen))
+            painter.drawEllipse(legend_rect.left() + 10, y - 8, 10, 10)
+            painter.setPen(QPen(QColor("#111827"), 1))
+            painter.drawText(legend_rect.left() + 28, y, f"{group_name}: {len(results)}")
+            y += 20
+        if self.show_reference_background:
+            y += 8
+            painter.setPen(QPen(QColor("#64748b"), 1))
+            painter.drawText(legend_rect.left() + 10, y, "background: reference")
+
+
+class ContrastSourceRow(QWidget):
+    removed = pyqtSignal(object)
+    changed = pyqtSignal()
+
+    def __init__(self, spec: ContrastSourceSpec, recursive_provider, browse_start_provider, browse_memory_updater) -> None:
+        super().__init__()
+        self.recursive_provider = recursive_provider
+        self.browse_start_provider = browse_start_provider
+        self.browse_memory_updater = browse_memory_updater
+        self.csv_count = 0
+        self._updating = False
+
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("组名")
+        self.name_label = QLabel("名")
+        self.path_edit = QLineEdit()
+        self.path_edit.setPlaceholderText("选择 CSV 文件夹 / 文件 / glob")
+        self.path_label = QLabel("路")
+        self.path_edit.setText(spec.pattern)
+        self.browse_button = QPushButton("...")
+        self.browse_button.setMaximumWidth(34)
+        self.remove_button = QPushButton("-")
+        self.remove_button.setMaximumWidth(30)
+        self.count_label = QLabel("CSV: 0")
+        self.count_label.setMinimumWidth(52)
+        self.range_label = QLabel("点")
+        self.to_label = QLabel("到")
+        self.start_spin = QSpinBox()
+        self.start_spin.setRange(1, 1)
+        self.start_spin.setMaximumWidth(58)
+        self.end_spin = QSpinBox()
+        self.end_spin.setRange(1, 1)
+        self.end_spin.setMaximumWidth(58)
+        self.full_range_button = QPushButton("全选")
+        self.full_range_button.setMaximumWidth(48)
+
+        self.name_edit.setText(spec.group_name)
+
+        top_row = QHBoxLayout()
+        top_row.setContentsMargins(0, 0, 0, 0)
+        top_row.setSpacing(4)
+        top_row.addWidget(self.name_label)
+        top_row.addWidget(self.name_edit, stretch=1)
+        top_row.addWidget(self.count_label)
+        top_row.addWidget(self.remove_button)
+
+        path_row = QHBoxLayout()
+        path_row.setContentsMargins(0, 0, 0, 0)
+        path_row.setSpacing(4)
+        path_row.addWidget(self.path_label)
+        path_row.addWidget(self.path_edit, stretch=1)
+        path_row.addWidget(self.browse_button)
+
+        range_row = QHBoxLayout()
+        range_row.setContentsMargins(0, 0, 0, 0)
+        range_row.setSpacing(4)
+        range_row.addWidget(self.range_label)
+        range_row.addWidget(self.start_spin)
+        range_row.addWidget(self.to_label)
+        range_row.addWidget(self.end_spin)
+        range_row.addWidget(self.full_range_button)
+        range_row.addStretch(1)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 4, 6, 4)
+        layout.setSpacing(3)
+        layout.addLayout(top_row)
+        layout.addLayout(path_row)
+        layout.addLayout(range_row)
+
+        self.setStyleSheet(
+            """
+            ContrastSourceRow {
+                border: 1px solid #cbd5e1;
+                border-radius: 6px;
+                background: #ffffff;
+            }
+            ContrastSourceRow QLabel {
+                font-size: 12px;
+            }
+            ContrastSourceRow QLineEdit,
+            ContrastSourceRow QSpinBox,
+            ContrastSourceRow QPushButton {
+                font-size: 12px;
+                padding: 2px 5px;
+                min-height: 22px;
+            }
+            """
+        )
+
+        self.browse_button.clicked.connect(self._browse_path)
+        self.remove_button.clicked.connect(lambda: self.removed.emit(self))
+        self.path_edit.textChanged.connect(self._on_path_changed)
+        self.name_edit.textChanged.connect(self.changed.emit)
+        self.start_spin.valueChanged.connect(self._on_spin_changed)
+        self.end_spin.valueChanged.connect(self._on_spin_changed)
+        self.full_range_button.clicked.connect(self._select_full_range)
+
+        self._refresh_file_count()
+        initial_end = spec.end_index if spec.end_index > 0 else max(1, self.csv_count)
+        self._set_range_values(spec.start_index, initial_end)
+
+    def to_spec(self) -> ContrastSourceSpec:
+        return ContrastSourceSpec(
+            pattern=self.path_edit.text().strip(),
+            start_index=self.start_spin.value(),
+            end_index=self.end_spin.value(),
+            group_name=self.name_edit.text().strip(),
+        )
+
+    def refresh_file_count(self) -> None:
+        self._refresh_file_count()
+
+    def _browse_path(self) -> None:
+        start_dir = self.browse_start_provider(self.path_edit.text().strip())
+        selected_dir = QFileDialog.getExistingDirectory(
+            self,
+            "选择一个对比数据目录",
+            str(start_dir),
+        )
+        if selected_dir:
+            selected_path = Path(selected_dir)
+            self.browse_memory_updater(selected_path)
+            self.path_edit.setText(make_portable_path(selected_path))
+
+    def _on_path_changed(self) -> None:
+        self._refresh_file_count()
+        self.changed.emit()
+
+    def _refresh_file_count(self) -> None:
+        path_text = self.path_edit.text().strip()
+        count = 0
+        default_name = ""
+        if path_text:
+            try:
+                default_name, files = find_contrast_candidate_files(path_text, recursive=bool(self.recursive_provider()))
+                count = len(files)
+            except Exception:
+                count = 0
+        self.csv_count = count
+        self.count_label.setText(f"CSV: {count}")
+        self.count_label.setStyleSheet("color: #15803d;" if count > 0 else "color: #dc2626;")
+
+        if not self.name_edit.text().strip() and default_name:
+            self.name_edit.setText(default_name)
+
+        max_value = max(1, count)
+        old_start = min(max(1, self.start_spin.value()), max_value)
+        old_end = min(max(old_start, self.end_spin.value()), max_value)
+        self._updating = True
+        self.start_spin.setRange(1, max_value)
+        self.end_spin.setRange(1, max_value)
+        self._updating = False
+        self._set_range_values(old_start, old_end if count > 0 else 1)
+        enabled = count > 0
+        self.start_spin.setEnabled(enabled)
+        self.end_spin.setEnabled(enabled)
+        self.full_range_button.setEnabled(enabled)
+
+    def _set_range_values(self, start_value: int, end_value: int) -> None:
+        max_value = max(1, self.csv_count)
+        start_value = min(max(1, int(start_value)), max_value)
+        end_value = min(max(start_value, int(end_value)), max_value)
+        self._updating = True
+        self.start_spin.setValue(start_value)
+        self.end_spin.setValue(end_value)
+        self._updating = False
+        self.changed.emit()
+
+    def _on_spin_changed(self) -> None:
+        if self._updating:
+            return
+        start_value = self.start_spin.value()
+        end_value = self.end_spin.value()
+        if start_value > end_value:
+            sender = self.sender()
+            if sender is self.start_spin:
+                end_value = start_value
+            else:
+                start_value = end_value
+        self._set_range_values(start_value, end_value)
+
+    def _select_full_range(self) -> None:
+        self._set_range_values(1, max(1, self.csv_count))
+
+
 class AcquisitionWorker(QObject):
     log_message = pyqtSignal(str)
     reference_ready = pyqtSignal(object)
     frame_ready = pyqtSignal(object)
+    contrast_point_ready = pyqtSignal(object)
+    contrast_progress_changed = pyqtSignal(object)
     playback_state_changed = pyqtSignal(object)
     error = pyqtSignal(str)
     finished = pyqtSignal()
@@ -2526,6 +3258,9 @@ class AcquisitionWorker(QObject):
     @pyqtSlot()
     def run(self) -> None:
         try:
+            if self.settings.ui.last_mode == "contrast" and self.settings.analysis.algorithm_id != "scd_icd_peak_v1":
+                raise ValueError("Contrast 对比模式初版仅支持经典峰值法（SCD–ICD）。请先把当前算法切回经典峰值法。")
+
             reference_stats: ReferenceStats | None = None
             if self.settings.analysis.algorithm_id == "scd_icd_peak_v1":
                 self.log_message.emit("Loading reference database...")
@@ -2543,6 +3278,10 @@ class AcquisitionWorker(QObject):
                 raise ValueError(f"Unsupported analysis algorithm: {self.settings.analysis.algorithm_id}")
             if self.settings.ui.last_mode == "hardware":
                 self._run_hardware(reference_stats)
+            elif self.settings.ui.last_mode == "contrast":
+                if reference_stats is None:
+                    raise ValueError("Contrast mode requires SCD–ICD reference statistics.")
+                self._run_contrast(reference_stats)
             else:
                 self._run_playback(reference_stats)
         except Exception as exc:
@@ -2671,6 +3410,69 @@ class AcquisitionWorker(QObject):
                 if not self._advance_playback_index():
                     return
                 continue
+
+    def _run_contrast(self, reference_stats: ReferenceStats) -> None:
+        sources = resolve_contrast_sources(
+            self.settings.contrast.source_patterns,
+            recursive=self.settings.contrast.recursive,
+            max_files_per_group=self.settings.contrast.max_files_per_group,
+        )
+        total_files = sum(len(files) for _, files in sources)
+        if total_files <= 0:
+            raise FileNotFoundError("No contrast CSV files matched the configured input.")
+
+        self.contrast_progress_changed.emit(ContrastProgress(current=0, total=total_files))
+        self.log_message.emit(
+            f"Contrast queue prepared with {len(sources)} groups and {total_files} CSV files."
+        )
+
+        processed = 0
+        skipped = 0
+        for group_name, files in sources:
+            if self._stop_requested:
+                break
+            self.log_message.emit(f"Contrast group '{group_name}' started: {len(files)} files.")
+            for file_path in files:
+                if self._stop_requested:
+                    break
+                processed += 1
+                try:
+                    signal, sample_rate_hz = load_signal_csv(file_path, self.settings.analysis.target_sample_count)
+                    effective_sample_rate = sample_rate_hz or self.settings.hardware.sample_rate_hz
+                    metrics = analyze_signal(
+                        signal=signal,
+                        sample_rate_hz=effective_sample_rate,
+                        analysis_settings=self.settings.analysis,
+                        reference_stats=reference_stats,
+                        file_name=file_path.name,
+                        relative_path=relative_to_workspace(file_path),
+                        group_name=group_name,
+                    )
+                    self.contrast_point_ready.emit(
+                        ContrastPoint(
+                            metrics=metrics,
+                            group_name=group_name,
+                            file_name=file_path.name,
+                            relative_path=relative_to_workspace(file_path),
+                            sequence_index=processed,
+                        )
+                    )
+                except Exception as exc:
+                    skipped += 1
+                    self.log_message.emit(f"Contrast skipped {file_path.name}: {exc}")
+                self.contrast_progress_changed.emit(
+                    ContrastProgress(
+                        current=processed,
+                        total=total_files,
+                        current_group=group_name,
+                        current_file=file_path.name,
+                        skipped=skipped,
+                    )
+                )
+
+        self.log_message.emit(
+            f"Contrast finished: {processed - skipped}/{total_files} files analyzed, {skipped} skipped."
+        )
 
     def _run_hardware(self, reference_stats: ReferenceStats | None) -> None:
         output_dir = resolve_workspace_path(self.settings.hardware.output_dir)
@@ -2873,6 +3675,7 @@ class MainWindow(QMainWindow):
         self.signal_generator_client = SignalGeneratorClient()
         self.signal_generator_output_is_on: bool | None = None
         self.scpi_console_dialog: ScpiConsoleDialog | None = None
+        self.last_contrast_browse_dir: Path | None = None
 
         self.setWindowTitle("ART + PCD Integrated Monitor")
         self.resize(1480, 900)
@@ -2891,14 +3694,21 @@ class MainWindow(QMainWindow):
         root_layout.addWidget(splitter)
 
         left_panel = QWidget()
-        left_panel.setMaximumWidth(540)
-        left_layout = QVBoxLayout(left_panel)
-        left_layout.setContentsMargins(8, 8, 8, 8)
-        left_layout.setSpacing(10)
+        left_panel.setMaximumWidth(600)
+        left_outer_layout = QVBoxLayout(left_panel)
+        left_outer_layout.setContentsMargins(8, 8, 8, 8)
+        left_outer_layout.setSpacing(8)
+
+        left_settings_panel = QWidget()
+        left_settings_layout = QVBoxLayout(left_settings_panel)
+        left_settings_layout.setContentsMargins(0, 0, 0, 0)
+        left_settings_layout.setSpacing(10)
+        left_layout = left_settings_layout
 
         self.mode_combo = QComboBox()
         self.mode_combo.addItem("Playback 回放", "playback")
         self.mode_combo.addItem("Hardware 真机", "hardware")
+        self.mode_combo.addItem("Contrast 对比", "contrast")
         self.mode_combo.currentIndexChanged.connect(self._update_mode_visibility)
 
         mode_group = QGroupBox("运行模式")
@@ -2961,6 +3771,57 @@ class MainWindow(QMainWindow):
         playback_form.addRow("跳帧", playback_control_row)
         playback_form.addRow("当前帧", playback_action_row)
         left_layout.addWidget(self.playback_group)
+
+        self.contrast_rows: list[ContrastSourceRow] = []
+        self.contrast_rows_widget = QWidget()
+        self.contrast_rows_layout = QVBoxLayout(self.contrast_rows_widget)
+        self.contrast_rows_layout.setContentsMargins(0, 0, 0, 0)
+        self.contrast_rows_layout.setSpacing(6)
+        self.contrast_rows_layout.setAlignment(Qt.AlignTop)
+        self.contrast_rows_scroll = QScrollArea()
+        self.contrast_rows_scroll.setWidgetResizable(True)
+        self.contrast_rows_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.contrast_rows_scroll.setFrameShape(QScrollArea.NoFrame)
+        self.contrast_rows_scroll.setFixedHeight(96)
+        self.contrast_rows_scroll.setWidget(self.contrast_rows_widget)
+        self.contrast_range_hint_label = QLabel("每组可自定义组名；CSV 数量按当前路径实时统计；点范围按文件名排序后的序号裁剪。")
+        self.contrast_range_hint_label.setWordWrap(True)
+        self.contrast_add_dir_button = QPushButton("+ 添加数据组")
+        self.contrast_add_dir_button.clicked.connect(self._add_contrast_source_group)
+        self.contrast_clear_sources_button = QPushButton("清空")
+        self.contrast_clear_sources_button.clicked.connect(self._clear_contrast_source_groups)
+        self.contrast_recursive_check = QCheckBox("递归包含子文件夹")
+        self.contrast_recursive_check.toggled.connect(self._refresh_contrast_source_rows)
+        self.contrast_reference_background_check = QCheckBox("显示参考背景")
+        self.contrast_max_files_spin = QSpinBox()
+        self.contrast_max_files_spin.setRange(0, 100_000)
+        self.contrast_max_files_spin.setSpecialValueText("不限")
+
+        contrast_source_button_row = QWidget()
+        contrast_source_button_layout = QHBoxLayout(contrast_source_button_row)
+        contrast_source_button_layout.setContentsMargins(0, 0, 0, 0)
+        contrast_source_button_layout.setSpacing(4)
+        contrast_source_button_layout.addWidget(self.contrast_add_dir_button)
+        contrast_source_button_layout.addWidget(self.contrast_clear_sources_button)
+
+        self.contrast_group = QGroupBox("对比设置")
+        contrast_layout = QVBoxLayout(self.contrast_group)
+        contrast_layout.setContentsMargins(8, 8, 8, 8)
+        contrast_layout.setSpacing(6)
+        contrast_layout.addWidget(self.contrast_rows_scroll)
+        contrast_layout.addWidget(self.contrast_range_hint_label)
+        contrast_layout.addWidget(contrast_source_button_row)
+        contrast_layout.addWidget(self.contrast_recursive_check)
+        contrast_layout.addWidget(self.contrast_reference_background_check)
+
+        contrast_limit_row = QWidget()
+        contrast_limit_layout = QHBoxLayout(contrast_limit_row)
+        contrast_limit_layout.setContentsMargins(0, 0, 0, 0)
+        contrast_limit_layout.setSpacing(6)
+        contrast_limit_layout.addWidget(QLabel("每组最多文件"))
+        contrast_limit_layout.addWidget(self.contrast_max_files_spin, stretch=1)
+        contrast_layout.addWidget(contrast_limit_row)
+        left_layout.addWidget(self.contrast_group)
 
         self.dll_path_edit = QLineEdit()
         self.dll_browse_button = QPushButton("选择 DLL")
@@ -3286,6 +4147,19 @@ class MainWindow(QMainWindow):
         display_form.addRow("", self.show_reference_points_check)
         left_layout.addWidget(display_group)
 
+        self.import_settings_button = QPushButton("导入设置")
+        self.import_settings_button.clicked.connect(self._import_settings_profile)
+        self.export_settings_button = QPushButton("导出设置")
+        self.export_settings_button.clicked.connect(self._export_settings_profile)
+        profile_button_row = QHBoxLayout()
+        profile_button_row.addWidget(self.import_settings_button)
+        profile_button_row.addWidget(self.export_settings_button)
+        self.profile_group = QGroupBox("设置方案")
+        profile_group_layout = QVBoxLayout(self.profile_group)
+        profile_group_layout.setContentsMargins(8, 8, 8, 8)
+        profile_group_layout.setSpacing(6)
+        profile_group_layout.addLayout(profile_button_row)
+
         button_row = QHBoxLayout()
         self.start_button = QPushButton("开始")
         self.start_button.clicked.connect(self.start_processing)
@@ -3297,8 +4171,21 @@ class MainWindow(QMainWindow):
         button_row.addWidget(self.start_button)
         button_row.addWidget(self.stop_button)
         button_row.addWidget(self.clear_button)
-        left_layout.addLayout(button_row)
-        left_layout.addStretch(1)
+        self.contrast_progress_bar = QProgressBar()
+        self.contrast_progress_bar.setRange(0, 100)
+        self.contrast_progress_bar.setValue(0)
+        self.contrast_progress_bar.setTextVisible(True)
+        self.contrast_progress_label = QLabel("对比进度：-")
+        self.contrast_progress_label.setWordWrap(True)
+
+        self.left_action_panel = QWidget()
+        left_action_layout = QVBoxLayout(self.left_action_panel)
+        left_action_layout.setContentsMargins(0, 0, 0, 0)
+        left_action_layout.setSpacing(6)
+        left_action_layout.addWidget(self.profile_group)
+        left_action_layout.addLayout(button_row)
+        left_action_layout.addWidget(self.contrast_progress_bar)
+        left_action_layout.addWidget(self.contrast_progress_label)
 
         right_panel = QWidget()
         right_panel_layout = QVBoxLayout(right_panel)
@@ -3426,23 +4313,47 @@ class MainWindow(QMainWindow):
         iud_log_layout.addWidget(self.iud_log_output)
         iud_result_layout.addWidget(iud_log_group, stretch=1)
         self.algorithm_result_stack.addWidget(iud_result_page)
-        self.log_outputs = [self.log_output, self.iud_log_output]
+
+        contrast_result_page = QWidget()
+        contrast_result_layout = QVBoxLayout(contrast_result_page)
+        contrast_result_layout.setContentsMargins(8, 8, 8, 8)
+        contrast_result_layout.setSpacing(10)
+        self.contrast_chart_widget = PcdContrastWidget()
+        contrast_result_layout.addWidget(self.contrast_chart_widget, stretch=7)
+        self.contrast_summary_label = QLabel("尚未生成对比结果。")
+        self.contrast_summary_label.setWordWrap(True)
+        contrast_summary_group = QGroupBox("对比结果概览")
+        contrast_summary_layout = QVBoxLayout(contrast_summary_group)
+        contrast_summary_layout.addWidget(self.contrast_summary_label)
+        contrast_result_layout.addWidget(contrast_summary_group, stretch=0)
+        contrast_log_group = QGroupBox("日志")
+        contrast_log_layout = QVBoxLayout(contrast_log_group)
+        self.contrast_log_output = QPlainTextEdit()
+        self.contrast_log_output.setReadOnly(True)
+        contrast_log_layout.addWidget(self.contrast_log_output)
+        contrast_result_layout.addWidget(contrast_log_group, stretch=2)
+        self.algorithm_result_stack.addWidget(contrast_result_page)
+
+        self.log_outputs = [self.log_output, self.iud_log_output, self.contrast_log_output]
         right_panel_layout.addWidget(self.algorithm_result_stack)
 
         self.algorithm_combo.currentIndexChanged.connect(self._on_algorithm_changed)
+        self.contrast_reference_background_check.toggled.connect(self.contrast_chart_widget.set_show_reference_background)
         self._on_algorithm_changed(self.algorithm_combo.currentIndex())
 
         left_scroll = QScrollArea()
         left_scroll.setWidgetResizable(True)
         left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         left_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        left_scroll.setMaximumWidth(560)
+        left_scroll.setMaximumWidth(620)
         left_scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
-        left_scroll.setWidget(left_panel)
+        left_scroll.setWidget(left_settings_panel)
+        left_outer_layout.addWidget(left_scroll, stretch=1)
+        left_outer_layout.addWidget(self.left_action_panel, stretch=0)
 
-        splitter.addWidget(left_scroll)
+        splitter.addWidget(left_panel)
         splitter.addWidget(right_panel)
-        splitter.setSizes([420, 1020])
+        splitter.setSizes([500, 940])
         self._apply_visual_theme()
         self._set_signal_connection_visual(False)
 
@@ -3504,8 +4415,10 @@ class MainWindow(QMainWindow):
         """
         for group in (
             self.hardware_group,
+            self.contrast_group,
             self.signal_generator_group,
             self.analysis_group,
+            self.profile_group,
         ):
             group.setStyleSheet(panel_group_style)
 
@@ -3523,6 +4436,8 @@ class MainWindow(QMainWindow):
         self.start_button.setStyleSheet(self._button_style("#16a34a", "#15803d"))
         self.stop_button.setStyleSheet(self._button_style("#dc2626", "#b91c1c"))
         self.clear_button.setStyleSheet(self._button_style("#64748b", "#475569"))
+        self.import_settings_button.setStyleSheet(self._button_style("#f3f4f6", "#cbd5e1", "#1f2937"))
+        self.export_settings_button.setStyleSheet(self._button_style("#f3f4f6", "#cbd5e1", "#1f2937"))
         self.hardware_status_label.setStyleSheet("color: #475569; font-weight: 600;")
 
     def _set_signal_connection_visual(self, connected: bool) -> None:
@@ -3552,7 +4467,10 @@ class MainWindow(QMainWindow):
         if index < 0:
             return
         self.algorithm_settings_stack.setCurrentIndex(index)
-        self.algorithm_result_stack.setCurrentIndex(index)
+        if self.mode_combo.currentData() == "contrast":
+            self.algorithm_result_stack.setCurrentIndex(2)
+        else:
+            self.algorithm_result_stack.setCurrentIndex(index)
         uses_reference_database = self.algorithm_combo.currentData() == "scd_icd_peak_v1"
         self.show_reference_points_check.setEnabled(uses_reference_database)
         self._set_playback_ui_state(self.playback_state)
@@ -3611,10 +4529,19 @@ class MainWindow(QMainWindow):
         self.analysis_summary_label.setText(self.algorithm_combo.currentText())
 
     def _apply_settings_to_ui(self, settings: AppSettings) -> None:
-        self.mode_combo.setCurrentIndex(0 if settings.ui.last_mode == "playback" else 1)
+        mode_index = self.mode_combo.findData(settings.ui.last_mode)
+        self.mode_combo.setCurrentIndex(max(mode_index, 0))
         self.playback_source_edit.setText(join_patterns(settings.playback.source_patterns))
         self.playback_interval_spin.setValue(settings.playback.interval_ms)
         self.playback_loop_check.setChecked(settings.playback.loop_playback)
+        if settings.contrast.last_browse_dir:
+            self.last_contrast_browse_dir = resolve_workspace_path(settings.contrast.last_browse_dir)
+        self._set_contrast_source_groups(settings.contrast.source_patterns)
+        self.contrast_recursive_check.setChecked(settings.contrast.recursive)
+        self._refresh_contrast_source_rows()
+        self.contrast_reference_background_check.setChecked(settings.contrast.show_reference_background)
+        self.contrast_max_files_spin.setValue(settings.contrast.max_files_per_group)
+        self.contrast_chart_widget.set_show_reference_background(settings.contrast.show_reference_background)
         self.dll_path_edit.setText(settings.hardware.dll_path)
         self.device_id_spin.setValue(settings.hardware.device_id)
         self.sample_rate_spin.setValue(settings.hardware.sample_rate_hz)
@@ -3722,6 +4649,13 @@ class MainWindow(QMainWindow):
                 interval_ms=self.playback_interval_spin.value(),
                 loop_playback=self.playback_loop_check.isChecked(),
             ),
+            contrast=ContrastSettings(
+                source_patterns=self._contrast_source_patterns_from_rows(),
+                recursive=self.contrast_recursive_check.isChecked(),
+                max_files_per_group=self.contrast_max_files_spin.value(),
+                show_reference_background=self.contrast_reference_background_check.isChecked(),
+                last_browse_dir=make_portable_path(self.last_contrast_browse_dir) if self.last_contrast_browse_dir else "",
+            ),
             reference=ReferenceSettings(
                 no_cavitation_patterns=split_patterns(self.reference_no_edit.text()),
                 cavitation_patterns=split_patterns(self.reference_cav_edit.text()),
@@ -3739,10 +4673,20 @@ class MainWindow(QMainWindow):
         )
 
     def _update_mode_visibility(self) -> None:
-        is_hardware = self.mode_combo.currentData() == "hardware"
-        self.playback_group.setEnabled(not is_hardware)
+        current_mode = self.mode_combo.currentData()
+        is_hardware = current_mode == "hardware"
+        is_playback = current_mode == "playback"
+        is_contrast = current_mode == "contrast"
+        self.playback_group.setEnabled(is_playback)
         self.hardware_group.setEnabled(is_hardware)
         self.signal_generator_group.setEnabled(is_hardware)
+        self.contrast_group.setEnabled(is_contrast)
+        self.contrast_progress_bar.setVisible(is_contrast)
+        self.contrast_progress_label.setVisible(is_contrast)
+        if is_contrast:
+            self.algorithm_result_stack.setCurrentIndex(2)
+        else:
+            self.algorithm_result_stack.setCurrentIndex(max(self.algorithm_combo.currentIndex(), 0))
         self._set_playback_ui_state(self.playback_state)
 
     def _set_playback_ui_state(self, state: PlaybackUiState) -> None:
@@ -3815,6 +4759,110 @@ class MainWindow(QMainWindow):
         if selected_dir:
             portable = make_portable_path(Path(selected_dir))
             self.playback_source_edit.setText(f"{portable}/*.csv")
+
+    def _set_contrast_source_groups(self, source_patterns: list[str]) -> None:
+        self._clear_contrast_source_groups(add_default_if_empty=False)
+        for raw_pattern in source_patterns:
+            raw_pattern = raw_pattern.strip()
+            if not raw_pattern:
+                continue
+            try:
+                spec = parse_contrast_source_spec(raw_pattern)
+            except Exception:
+                spec = ContrastSourceSpec(pattern=raw_pattern)
+            self._add_contrast_source_row(spec)
+        if not self.contrast_rows:
+            self._add_contrast_source_row(ContrastSourceSpec(pattern="data/playback"))
+
+    def _contrast_source_patterns_from_rows(self) -> list[str]:
+        patterns: list[str] = []
+        for row in self.contrast_rows:
+            spec = row.to_spec()
+            if spec.pattern:
+                patterns.append(format_contrast_source_spec(spec))
+        return patterns
+
+    def _add_contrast_source_group(self) -> None:
+        self._add_contrast_source_row(ContrastSourceSpec(pattern="", group_name=f"Group {len(self.contrast_rows) + 1}"))
+
+    def _add_contrast_source_row(self, spec: ContrastSourceSpec) -> ContrastSourceRow:
+        row = ContrastSourceRow(
+            spec,
+            recursive_provider=lambda: self.contrast_recursive_check.isChecked(),
+            browse_start_provider=self._contrast_browse_start_dir,
+            browse_memory_updater=self._remember_contrast_browse_dir,
+        )
+        row.removed.connect(self._remove_contrast_source_row)
+        row.changed.connect(lambda: self.statusBar().showMessage("Contrast source group updated."))
+        self.contrast_rows_layout.addWidget(row)
+        self.contrast_rows.append(row)
+        self._update_contrast_rows_scroll_height()
+        return row
+
+    def _contrast_browse_start_dir(self, current_path_text: str = "") -> Path:
+        current_path_text = current_path_text.strip()
+        if current_path_text:
+            try:
+                current_path = resolve_workspace_path(current_path_text)
+                if current_path.exists():
+                    return current_path if current_path.is_dir() else current_path.parent
+                parent = current_path.parent
+                if parent.exists():
+                    return parent
+            except Exception:
+                pass
+
+        if self.last_contrast_browse_dir is not None and self.last_contrast_browse_dir.exists():
+            return self.last_contrast_browse_dir
+
+        for row in reversed(getattr(self, "contrast_rows", [])):
+            row_path_text = row.path_edit.text().strip()
+            if not row_path_text:
+                continue
+            try:
+                row_path = resolve_workspace_path(row_path_text)
+                if row_path.exists():
+                    return row_path if row_path.is_dir() else row_path.parent
+                parent = row_path.parent
+                if parent.exists():
+                    return parent
+            except Exception:
+                continue
+        return resolve_workspace_path("data")
+
+    def _remember_contrast_browse_dir(self, selected_path: Path) -> None:
+        selected_path = selected_path.resolve()
+        self.last_contrast_browse_dir = selected_path if selected_path.is_dir() else selected_path.parent
+
+    def _remove_contrast_source_row(self, row: ContrastSourceRow) -> None:
+        if row in self.contrast_rows:
+            self.contrast_rows.remove(row)
+        self.contrast_rows_layout.removeWidget(row)
+        row.deleteLater()
+        self._update_contrast_rows_scroll_height()
+        if not self.contrast_rows:
+            self.contrast_summary_label.setText("尚未添加对比数据组。")
+
+    def _clear_contrast_source_groups(self, add_default_if_empty: bool = True) -> None:
+        for row in list(getattr(self, "contrast_rows", [])):
+            self._remove_contrast_source_row(row)
+        if add_default_if_empty:
+            self._add_contrast_source_row(ContrastSourceSpec(pattern="data/playback"))
+
+    def _refresh_contrast_source_rows(self) -> None:
+        for row in getattr(self, "contrast_rows", []):
+            row.refresh_file_count()
+        self._update_contrast_rows_scroll_height()
+
+    def _update_contrast_rows_scroll_height(self) -> None:
+        if not hasattr(self, "contrast_rows_scroll"):
+            return
+        row_count = len(getattr(self, "contrast_rows", []))
+        if row_count <= 0:
+            self.contrast_rows_scroll.setFixedHeight(54)
+            return
+        height = min(220, max(92, row_count * 96 + (row_count - 1) * 5))
+        self.contrast_rows_scroll.setFixedHeight(height)
 
     def _browse_dll_path(self) -> None:
         file_path, _ = QFileDialog.getOpenFileName(
@@ -4004,7 +5052,73 @@ class MainWindow(QMainWindow):
         self.waveform_widget.clear_data()
         self.iud_curve_widget.clear_data()
         self.iud_treatment_trend_widget.clear_data()
+        self.contrast_chart_widget.clear_results()
+        self.contrast_summary_label.setText("尚未生成对比结果。")
+        self.contrast_progress_bar.setValue(0)
+        self.contrast_progress_label.setText("对比进度：-")
         self.append_log("Live points cleared.")
+
+    def _export_settings_profile(self) -> None:
+        if self.worker_thread and self.worker_thread.isRunning():
+            QMessageBox.warning(self, "正在运行", "请先停止当前运行，再导出设置。")
+            return
+        try:
+            settings = self._collect_settings_from_ui()
+        except Exception as exc:
+            QMessageBox.critical(self, "配置错误", f"当前设置无法导出：\n{exc}")
+            return
+
+        default_name = f"PCD设置方案_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        default_path = settings_path().parent / default_name
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出设置方案",
+            str(default_path),
+            "JSON 设置文件 (*.json);;所有文件 (*)",
+        )
+        if not file_path:
+            return
+
+        export_path = Path(file_path)
+        if not export_path.suffix:
+            export_path = export_path.with_suffix(".json")
+        try:
+            save_app_settings_to_path(settings, export_path)
+            save_app_settings(settings)
+        except Exception as exc:
+            QMessageBox.critical(self, "导出失败", str(exc))
+            return
+        self.settings = settings
+        self.append_log(f"Settings profile exported: {export_path}")
+        QMessageBox.information(self, "导出完成", f"设置方案已导出：\n{export_path}")
+
+    def _import_settings_profile(self) -> None:
+        if self.worker_thread and self.worker_thread.isRunning():
+            QMessageBox.warning(self, "正在运行", "请先停止当前运行，再导入设置。")
+            return
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "导入设置方案",
+            str(settings_path().parent),
+            "JSON 设置文件 (*.json);;所有文件 (*)",
+        )
+        if not file_path:
+            return
+
+        try:
+            imported_settings = load_app_settings_from_path(Path(file_path))
+            imported_settings.analysis.validate()
+            imported_settings.iud.validate(imported_settings.analysis.target_sample_count)
+            self.settings = imported_settings
+            self._apply_settings_to_ui(imported_settings)
+            self._update_mode_visibility()
+            save_app_settings(imported_settings)
+        except Exception as exc:
+            QMessageBox.critical(self, "导入失败", str(exc))
+            return
+
+        self.append_log(f"Settings profile imported: {file_path}")
+        QMessageBox.information(self, "导入完成", "设置方案已导入并应用。")
 
     def start_processing(self) -> None:
         if self.worker_thread and self.worker_thread.isRunning():
@@ -4018,25 +5132,57 @@ class MainWindow(QMainWindow):
 
         if self.settings.ui.last_mode == "hardware":
             if not self.signal_generator_client.connected:
-                QMessageBox.warning(self, "信号发生器未连接", "Hardware 模式开始前，请先连接信号发生器。")
-                self.append_log("Hardware start blocked: signal generator is not connected.")
-                return
-            result_text = self._write_signal_generator_settings()
-            if result_text is None:
-                QMessageBox.critical(self, "信号发生器参数写入失败", "无法写入当前信号发生器参数，已取消开始。")
-                self.append_log("Hardware start blocked: failed to configure signal generator.")
-                return
-            self.append_log(f"Signal generator configured before hardware start. {result_text}")
-            if not self._set_signal_generator_output(True):
-                QMessageBox.critical(self, "信号发生器输出失败", "无法自动打开信号发生器输出，已取消开始。")
-                self.append_log("Hardware start blocked: failed to turn signal generator output ON.")
-                return
+                self.append_log(
+                    "Signal generator is not connected. Skipping automatic configuration; "
+                    "hardware acquisition will start with manual signal-generator control."
+                )
+                self.statusBar().showMessage("Signal generator manual mode")
+            else:
+                result_text = self._write_signal_generator_settings()
+                if result_text is None:
+                    answer = QMessageBox.question(
+                        self,
+                        "信号发生器参数写入失败",
+                        "无法自动写入当前信号发生器参数。\n\n是否继续开始采集？\n"
+                        "如果继续，请确认信号发生器已经手动设置好。",
+                        QMessageBox.Yes | QMessageBox.No,
+                        QMessageBox.No,
+                    )
+                    if answer != QMessageBox.Yes:
+                        self.append_log("Hardware start cancelled: failed to configure signal generator.")
+                        return
+                    self.append_log("Signal generator auto-configuration failed; continuing with manual control.")
+                else:
+                    self.append_log(f"Signal generator configured before hardware start. {result_text}")
+                    if not self._set_signal_generator_output(True):
+                        answer = QMessageBox.question(
+                            self,
+                            "信号发生器输出失败",
+                            "无法自动打开信号发生器输出。\n\n是否继续开始采集？\n"
+                            "如果继续，请确认信号发生器输出已经手动打开。",
+                            QMessageBox.Yes | QMessageBox.No,
+                            QMessageBox.No,
+                        )
+                        if answer != QMessageBox.Yes:
+                            self.append_log("Hardware start cancelled: failed to turn signal generator output ON.")
+                            return
+                        self.append_log("Failed to turn signal generator output ON automatically; continuing with manual control.")
+
+        if self.settings.ui.last_mode == "contrast" and self.settings.analysis.algorithm_id != "scd_icd_peak_v1":
+            QMessageBox.warning(self, "对比模式暂不支持当前算法", "Contrast 对比模式初版仅支持经典峰值法（SCD–ICD）。")
+            self.append_log("Contrast start blocked: active algorithm is not SCD–ICD.")
+            return
 
         self.scatter_widget.clear_live_results()
         self.spectrum_widget.clear_data()
         self.waveform_widget.clear_data()
         self.iud_curve_widget.clear_data()
         self.iud_treatment_trend_widget.clear_data()
+        if self.settings.ui.last_mode == "contrast":
+            self.contrast_chart_widget.clear_results()
+            self.contrast_summary_label.setText("正在计算对比结果...")
+            self.contrast_progress_bar.setValue(0)
+            self.contrast_progress_label.setText("对比进度：准备中")
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self.algorithm_combo.setEnabled(False)
@@ -4050,6 +5196,8 @@ class MainWindow(QMainWindow):
         self.worker.log_message.connect(self.append_log)
         self.worker.reference_ready.connect(self._on_reference_ready)
         self.worker.frame_ready.connect(self._on_frame_ready)
+        self.worker.contrast_point_ready.connect(self._on_contrast_point_ready)
+        self.worker.contrast_progress_changed.connect(self._on_contrast_progress_changed)
         self.worker.playback_state_changed.connect(self._on_playback_state_changed)
         self.worker.error.connect(self._on_worker_error)
         self.worker.finished.connect(self.worker_thread.quit)
@@ -4062,20 +5210,43 @@ class MainWindow(QMainWindow):
         if self.worker is not None:
             self.worker.stop()
             if self.settings.ui.last_mode == "hardware":
-                self.append_log(
-                    "Stop requested. Signal generator will stay ON until the current acquisition finishes."
-                )
+                if self.signal_generator_client.connected:
+                    self.append_log(
+                        "Stop requested. Signal generator will stay ON until the current acquisition finishes."
+                    )
+                else:
+                    self.append_log("Stop requested. Manual signal-generator control is active.")
             else:
                 self.append_log("Stop requested. Waiting for the current acquisition to finish...")
             self.statusBar().showMessage("Stopping...")
 
     def _on_reference_ready(self, reference_stats: ReferenceStats) -> None:
         self.scatter_widget.set_reference_results(reference_stats.no_results, reference_stats.cav_results)
+        self.contrast_chart_widget.set_reference_results(reference_stats.no_results, reference_stats.cav_results)
 
     def _on_playback_state_changed(self, state: PlaybackUiState) -> None:
         self._set_playback_ui_state(state)
         if self.settings.analysis.algorithm_id == "iud_intrapulse_v1":
             self.iud_treatment_trend_widget.set_current_file(state.current_file)
+
+    def _on_contrast_point_ready(self, point: ContrastPoint) -> None:
+        self.contrast_chart_widget.add_point(point)
+        self.contrast_summary_label.setText(self.contrast_chart_widget.summary_text())
+        self.statusBar().showMessage(f"Contrast point {point.sequence_index}: {point.group_name} / {point.file_name}")
+
+    def _on_contrast_progress_changed(self, progress: ContrastProgress) -> None:
+        if progress.total > 0:
+            self.contrast_progress_bar.setRange(0, progress.total)
+            self.contrast_progress_bar.setValue(progress.current)
+            percent = 100.0 * progress.current / max(progress.total, 1)
+            current_text = f"{progress.current_group} / {progress.current_file}" if progress.current_file else "准备中"
+            self.contrast_progress_label.setText(
+                f"对比进度：{progress.current}/{progress.total} ({percent:.1f}%)，跳过 {progress.skipped}；{current_text}"
+            )
+        else:
+            self.contrast_progress_bar.setRange(0, 100)
+            self.contrast_progress_bar.setValue(0)
+            self.contrast_progress_label.setText("对比进度：准备中")
 
     def _on_frame_ready(self, frame: AnalysisFrame) -> None:
         if isinstance(frame.metrics, IudMetrics):
@@ -4190,12 +5361,24 @@ def load_app_settings() -> AppSettings:
         settings = AppSettings()
         save_app_settings(settings)
         return settings
-    with config_path.open("r", encoding="utf-8") as handle:
-        return AppSettings.from_dict(json.load(handle))
+    return load_app_settings_from_path(config_path)
 
 
 def save_app_settings(settings: AppSettings) -> None:
-    with settings_path().open("w", encoding="utf-8") as handle:
+    save_app_settings_to_path(settings, settings_path())
+
+
+def load_app_settings_from_path(config_path: Path) -> AppSettings:
+    with config_path.open("r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    if not isinstance(data, dict):
+        raise ValueError("设置文件格式不正确：顶层内容不是 JSON 对象。")
+    return AppSettings.from_dict(data)
+
+
+def save_app_settings_to_path(settings: AppSettings, config_path: Path) -> None:
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    with config_path.open("w", encoding="utf-8") as handle:
         json.dump(settings.to_dict(), handle, indent=2, ensure_ascii=False)
 
 
