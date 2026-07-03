@@ -1,0 +1,91 @@
+{
+  "hardware": {
+    "dll_path": "vendor/ACTS1000_64.dll",
+    "device_id": 0,
+    "sample_rate_hz": 25000000.0,
+    "points": 25000,
+    "input_range": "pm1000",
+    "input_impedance": "1m",
+    "trigger_source": "dtr",
+    "timeout_seconds": 2.0,
+    "save_csv": true,
+    "output_dir": "Temp/12/12-9 fus接功放，功放连发生器连插座"
+  },
+  "signal_generator": {
+    "resource_name": "USB0::0x1AB1::0x0642::DG1ZA183201862::INSTR",
+    "timeout_ms": 3000,
+    "channel": 1,
+    "frequency_hz": 608000.0,
+    "amplitude_vpp": 3.0,
+    "offset_v": 0.0,
+    "load": "INF",
+    "prf_hz": 5.0,
+    "burst_cycles": 6000
+  },
+  "playback": {
+    "source_patterns": [
+      "Temp/11 手握住PCD试试看/*.csv"
+    ],
+    "interval_ms": 50,
+    "loop_playback": false
+  },
+  "contrast": {
+    "source_patterns": [
+      "功放双接地 || Temp/12/12-9 fus接功放，功放连发生器连插座 | 1 | 76",
+      "功放双不接地 || Temp/12/12-6 fus接功放，功放不插插座不连发生器 | 1 | 77",
+      "功放接电源地 || Temp/12/12-7 fus接功放，功放插插座不连发生器 | 1 | 90",
+      "功放接发生器地 || Temp/12/12-8 fus接功放，功放连发生器不插插座 | 1 | 89",
+      "FUS探头悬空 || Temp/12/12-5 pcd跟fus在水中碰在一起，但fus不接功放 | 1 | 95"
+    ],
+    "recursive": false,
+    "max_files_per_group": 0,
+    "show_reference_background": true,
+    "last_browse_dir": "Temp/12/12-9 fus接功放，功放连发生器连插座"
+  },
+  "reference": {
+    "no_cavitation_patterns": [
+      "data/reference/no_cavitation/*.csv"
+    ],
+    "cavitation_patterns": [
+      "data/reference/cavitation/*.csv"
+    ]
+  },
+  "analysis": {
+    "algorithm_id": "scd_icd_peak_v1",
+    "spectrum_mode": "power",
+    "use_segment_average": true,
+    "segment_count": 2,
+    "target_sample_count": 25000,
+    "search_band_low_hz": 450000.0,
+    "search_band_high_hz": 750000.0,
+    "peak_half_width_hz": 10000.0,
+    "noise_half_width_hz": 30000.0,
+    "broadband_half_width_hz": 75000.0,
+    "order_range_low": 1.5,
+    "order_range_high": 5.25,
+    "min_peak_prominence_db": 0.0
+  },
+  "iud": {
+    "window_count": 75,
+    "ultraharmonic_orders": [
+      1.5,
+      2.5,
+      3.5
+    ],
+    "auc_half_width_hz": 25000.0,
+    "noise_half_width_hz": 75000.0,
+    "subtract_local_noise": false,
+    "baseline_window_count": 1,
+    "instability_threshold_db": 8.0,
+    "normal_reference_db": 4.0,
+    "fixed_f0_hz": 0.0
+  },
+  "ui": {
+    "last_mode": "contrast",
+    "max_live_points": 500,
+    "show_reference_points": false,
+    "hardware_section_expanded": true,
+    "signal_generator_section_expanded": true,
+    "analysis_section_expanded": true
+  }
+}
