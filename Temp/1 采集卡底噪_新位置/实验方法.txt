@@ -1,6 +1,0 @@
-只保留采集卡上的trigger线
-
-采集卡插在主板上
-arduino接在主板usb口
-
-发生器、功放、arduino、cnc shield、示波器都在供电
