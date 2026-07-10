@@ -15,7 +15,7 @@ from ctypes import wintypes
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 import numpy as np
 from PyQt5.QtCore import QObject, QRect, Qt, QThread, pyqtSignal, pyqtSlot
@@ -446,6 +446,26 @@ class IudSettings:
 
 
 @dataclass
+class FusProbeSettings:
+    probe_amplitude_vpp: float = 4.5
+    treatment_amplitude_vpp: float = 7.0
+    inter_burst_delay_ms: int = 200
+    cycle_period_ms: int = 1000
+
+    def validate(self) -> None:
+        if self.probe_amplitude_vpp <= 0:
+            raise ValueError("FUS–Probe probe Vpp must be positive.")
+        if self.treatment_amplitude_vpp <= 0:
+            raise ValueError("FUS–Probe treatment Vpp must be positive.")
+        if self.inter_burst_delay_ms < 0:
+            raise ValueError("FUS–Probe inter-burst delay cannot be negative.")
+        if self.cycle_period_ms < 100:
+            raise ValueError("FUS–Probe cycle period must be at least 100 ms.")
+        if self.inter_burst_delay_ms >= self.cycle_period_ms:
+            raise ValueError("FUS–Probe inter-burst delay must be shorter than the cycle period.")
+
+
+@dataclass
 class UiSettings:
     last_mode: str = "playback"
     max_live_points: int = 150
@@ -464,6 +484,7 @@ class AppSettings:
     reference: ReferenceSettings = field(default_factory=ReferenceSettings)
     analysis: AnalysisSettings = field(default_factory=AnalysisSettings)
     iud: IudSettings = field(default_factory=IudSettings)
+    fus_probe: FusProbeSettings = field(default_factory=FusProbeSettings)
     ui: UiSettings = field(default_factory=UiSettings)
 
     def to_dict(self) -> dict:
@@ -479,6 +500,7 @@ class AppSettings:
             reference=ReferenceSettings(**data.get("reference", {})),
             analysis=AnalysisSettings.from_dict(data.get("analysis", {})),
             iud=IudSettings(**data.get("iud", {})),
+            fus_probe=FusProbeSettings(**data.get("fus_probe", {})),
             ui=UiSettings(**data.get("ui", {})),
         )
 
@@ -640,6 +662,59 @@ class SignalGeneratorClient:
             f"{source}:BURSt:STATe ON",
         ):
             self.write(command)
+
+    def configure_manual_burst_sine(
+        self,
+        channel: int,
+        frequency_hz: float,
+        amplitude_vpp: float,
+        offset_v: float,
+        load: str,
+        burst_cycles: int,
+    ) -> None:
+        """Prepare a finite burst that only starts after an explicit bus trigger."""
+        if channel not in (1, 2):
+            raise SignalGeneratorError("通道只能是 CH1 或 CH2。")
+        if frequency_hz <= 0 or amplitude_vpp <= 0 or burst_cycles < 1:
+            raise SignalGeneratorError("FUS–Probe burst 参数无效。")
+        if load not in ("INF", "50"):
+            raise SignalGeneratorError("负载只能选择 High-Z 或 50 Ω。")
+
+        self.set_output(channel, False)
+        if channel == 1:
+            self.write(f"OUTP:LOAD {load}")
+            self.write(f"APPL:SIN {frequency_hz:.12g},{amplitude_vpp:.12g},{offset_v:.12g}")
+        else:
+            self.write(f"OUTP:LOAD:CH2 {load}")
+            self.write(f"APPL:SIN:CH2 {frequency_hz:.12g},{amplitude_vpp:.12g},{offset_v:.12g}")
+
+        source = f"SOURce{channel}"
+        for command in (
+            f"{source}:BURSt:MODE TRIGgered",
+            f"{source}:BURSt:NCYCles {int(burst_cycles)}",
+        ):
+            self.write(command)
+        self.write(f"{source}:BURSt:TRIGger:SOURce MANual")
+        trigger_source_error = self.query_error()
+        if not trigger_source_error.startswith("0"):
+            # Older DG1000 firmware uses BUS for its manual trigger source.
+            self.write(f"{source}:BURSt:TRIGger:SOURce BUS")
+            trigger_source_error = self.query_error()
+            if not trigger_source_error.startswith("0"):
+                raise SignalGeneratorError(f"无法设置 FUS–Probe 手动触发源：{trigger_source_error}")
+        for command in (
+            f"{source}:BURSt:TRIGger:TRIGOut POSitive",
+            f"{source}:BURSt:STATe ON",
+        ):
+            self.write(command)
+
+    def set_burst_amplitude(self, channel: int, amplitude_vpp: float) -> None:
+        if channel not in (1, 2) or amplitude_vpp <= 0:
+            raise SignalGeneratorError("FUS–Probe burst 电压无效。")
+        self.write(f"SOURce{channel}:VOLTage:LEVel:IMMediate:AMPLitude {amplitude_vpp:.12g}")
+
+    def trigger_manual_burst(self) -> None:
+        self.write("*TRG")
 
     def query_error(self) -> str:
         return self.query("SYST:ERR?")
@@ -1019,7 +1094,7 @@ class Acts1000Device:
             self.api.ReleaseDevice(self.handle)
         self.handle = None
 
-    def capture_once(self) -> CaptureResult:
+    def capture_once(self, armed_callback: Callable[[], None] | None = None) -> CaptureResult:
         self.open()
 
         requested_points = int(self.settings.points)
@@ -1067,6 +1142,8 @@ class Acts1000Device:
             if not self.api.StartDeviceAD(self.handle):
                 raise RuntimeError("ACTS1000_StartDeviceAD failed.")
             ad_started = True
+            if armed_callback is not None:
+                armed_callback()
 
             captured_codes: list[int] = []
             while len(captured_codes) < hardware_points:
@@ -3274,10 +3351,22 @@ class AcquisitionWorker(QObject):
                     f"IUD analysis ready: {self.settings.iud.window_count} windows, "
                     f"threshold {self.settings.iud.instability_threshold_db:.1f} dB."
                 )
+            elif self.settings.analysis.algorithm_id == "fus_probe_interleaved_v1":
+                if self.settings.ui.last_mode != "hardware":
+                    raise ValueError("交替治疗–探测反馈当前仅支持 Hardware 真机模式。")
+                self.settings.fus_probe.validate()
+                self.log_message.emit(
+                    "FUS–Probe capture validation ready: "
+                    f"probe {self.settings.fus_probe.probe_amplitude_vpp:.3g} Vpp -> "
+                    f"treatment {self.settings.fus_probe.treatment_amplitude_vpp:.3g} Vpp."
+                )
             else:
                 raise ValueError(f"Unsupported analysis algorithm: {self.settings.analysis.algorithm_id}")
             if self.settings.ui.last_mode == "hardware":
-                self._run_hardware(reference_stats)
+                if self.settings.analysis.algorithm_id == "fus_probe_interleaved_v1":
+                    self._run_fus_probe_hardware()
+                else:
+                    self._run_hardware(reference_stats)
             elif self.settings.ui.last_mode == "contrast":
                 if reference_stats is None:
                     raise ValueError("Contrast mode requires SCD–ICD reference statistics.")
@@ -3524,6 +3613,249 @@ class AcquisitionWorker(QObject):
                     self.log_message.emit(
                         f"Hardware frame {frame_index}: score {metrics.cavitation_score:.3f}, risk {metrics.risk_score:.3f}, file {metrics.file or 'memory'}"
                     )
+
+    def _capture_fus_probe_segment(
+        self,
+        device: Acts1000Device,
+        generator: SignalGeneratorClient,
+        amplitude_vpp: float,
+        segment_name: str,
+    ) -> tuple[CaptureResult, datetime]:
+        """Arm ART first, then issue exactly one DG1000 manual burst trigger."""
+        generator.set_burst_amplitude(self.settings.signal_generator.channel, amplitude_vpp)
+        if generator.query("*OPC?") != "1":
+            raise SignalGeneratorError(f"{segment_name} 参数写入未完成。")
+        generator_error = generator.query_error()
+        if not generator_error.startswith("0"):
+            raise SignalGeneratorError(f"{segment_name} 参数写入错误：{generator_error}")
+
+        armed_event = threading.Event()
+        result_box: list[CaptureResult] = []
+        error_box: list[Exception] = []
+
+        def capture_target() -> None:
+            try:
+                result_box.append(device.capture_once(armed_callback=armed_event.set))
+            except Exception as exc:
+                error_box.append(exc)
+
+        capture_thread = threading.Thread(
+            target=capture_target,
+            name=f"FUS-Probe-{segment_name}-capture",
+            daemon=True,
+        )
+        capture_thread.start()
+        arm_wait_seconds = min(max(self.settings.hardware.timeout_seconds, 1.0), 5.0)
+        if not armed_event.wait(arm_wait_seconds):
+            capture_thread.join()
+            if error_box:
+                raise error_box[0]
+            raise RuntimeError(f"ART acquisition did not arm for {segment_name} within {arm_wait_seconds:.1f} s.")
+
+        generator.trigger_manual_burst()
+        capture_thread.join()
+        if error_box:
+            raise error_box[0]
+        if not result_box:
+            raise RuntimeError(f"ART capture returned no data for {segment_name}.")
+        return result_box[0], datetime.now()
+
+    def _move_fus_probe_staging_files(self, staging_dir: Path, target_dir: Path) -> None:
+        if not staging_dir.exists():
+            return
+        target_dir.mkdir(parents=True, exist_ok=True)
+        for file_path in staging_dir.glob("*.csv"):
+            shutil.move(str(file_path), str(target_dir / file_path.name))
+
+    def _run_fus_probe_hardware(self) -> None:
+        settings = self.settings.fus_probe
+        hardware = self.settings.hardware
+        generator_settings = self.settings.signal_generator
+        if not generator_settings.resource_name:
+            raise SignalGeneratorError("FUS–Probe 采集需要已配置的信号发生器 VISA 地址。")
+
+        run_started_at = datetime.now()
+        run_dir = resolve_workspace_path(hardware.output_dir) / f"fus_probe_{run_started_at.strftime('%Y%m%d_%H%M%S')}"
+        probe_dir = run_dir / "probe"
+        treatment_dir = run_dir / "treatment"
+        failed_dir = run_dir / "failed"
+        staging_dir = run_dir / "_staging"
+        for directory in (probe_dir, treatment_dir, failed_dir, staging_dir):
+            directory.mkdir(parents=True, exist_ok=True)
+
+        burst_duration_ms = 1000.0 * generator_settings.burst_cycles / generator_settings.frequency_hz
+        capture_window_ms = 1000.0 * hardware.points / hardware.sample_rate_hz
+        metadata = {
+            "run_started_at": run_started_at.isoformat(timespec="milliseconds"),
+            "algorithm": "fus_probe_interleaved_v1",
+            "sequence": "probe_then_treatment",
+            "signal_generator": asdict(generator_settings),
+            "fus_probe": asdict(settings),
+            "hardware": asdict(hardware),
+            "burst_duration_ms": burst_duration_ms,
+            "capture_window_ms": capture_window_ms,
+        }
+        with (run_dir / "run_metadata.json").open("w", encoding="utf-8") as metadata_file:
+            json.dump(metadata, metadata_file, ensure_ascii=False, indent=2)
+
+        self.log_message.emit(f"FUS–Probe run folder: {run_dir}")
+        if capture_window_ms < burst_duration_ms:
+            self.log_message.emit(
+                f"WARNING: ART capture window is {capture_window_ms:.3f} ms, shorter than the "
+                f"{burst_duration_ms:.3f} ms burst. Each CSV captures only the beginning of the burst."
+            )
+
+        generator = SignalGeneratorClient()
+        cycle_index = 0
+        try:
+            identity = generator.connect(generator_settings.resource_name, generator_settings.timeout_ms)
+            self.log_message.emit(f"FUS–Probe worker connected signal generator: {identity}")
+            generator.write("*CLS")
+            generator.configure_manual_burst_sine(
+                channel=generator_settings.channel,
+                frequency_hz=generator_settings.frequency_hz,
+                amplitude_vpp=settings.probe_amplitude_vpp,
+                offset_v=generator_settings.offset_v,
+                load=generator_settings.load,
+                burst_cycles=generator_settings.burst_cycles,
+            )
+            generator_error = generator.query_error()
+            if not generator_error.startswith("0"):
+                raise SignalGeneratorError(f"FUS–Probe signal generator configuration error: {generator_error}")
+            generator.set_output(generator_settings.channel, True)
+
+            manifest_path = run_dir / "manifest.csv"
+            with manifest_path.open("w", newline="", encoding="utf-8-sig") as manifest_file:
+                manifest_writer = csv.DictWriter(
+                    manifest_file,
+                    fieldnames=[
+                        "cycle_id",
+                        "status",
+                        "probe_file",
+                        "treatment_file",
+                        "probe_captured_at",
+                        "treatment_captured_at",
+                        "probe_vpp",
+                        "treatment_vpp",
+                        "frequency_hz",
+                        "burst_cycles",
+                        "inter_burst_delay_ms",
+                        "cycle_period_ms",
+                        "note",
+                    ],
+                )
+                manifest_writer.writeheader()
+                manifest_file.flush()
+
+                with Acts1000Device(hardware) as device:
+                    self.log_message.emit(
+                        f"ART device ready for FUS–Probe: {device.model_name}, base rate {device.base_rate:.0f} Hz."
+                    )
+                    while not self._stop_requested:
+                        cycle_index += 1
+                        cycle_started = time.perf_counter()
+                        cycle_name = f"cycle_{cycle_index:06d}.csv"
+                        probe_staging_path = staging_dir / f"probe_{cycle_name}"
+                        treatment_staging_path = staging_dir / f"treatment_{cycle_name}"
+                        try:
+                            probe_result, probe_time = self._capture_fus_probe_segment(
+                                device,
+                                generator,
+                                settings.probe_amplitude_vpp,
+                                "probe",
+                            )
+                            write_capture_csv(
+                                probe_staging_path,
+                                probe_result.raw_codes,
+                                probe_result.voltage_mv,
+                                probe_result.sample_rate_hz,
+                            )
+                            if not self._sleep_with_stop(settings.inter_burst_delay_ms):
+                                self._move_fus_probe_staging_files(staging_dir, failed_dir)
+                                self.log_message.emit(f"FUS–Probe stopped after probe capture in cycle {cycle_index}.")
+                                break
+
+                            treatment_result, treatment_time = self._capture_fus_probe_segment(
+                                device,
+                                generator,
+                                settings.treatment_amplitude_vpp,
+                                "treatment",
+                            )
+                            write_capture_csv(
+                                treatment_staging_path,
+                                treatment_result.raw_codes,
+                                treatment_result.voltage_mv,
+                                treatment_result.sample_rate_hz,
+                            )
+
+                            final_probe_path = probe_dir / cycle_name
+                            final_treatment_path = treatment_dir / cycle_name
+                            shutil.move(str(probe_staging_path), str(final_probe_path))
+                            shutil.move(str(treatment_staging_path), str(final_treatment_path))
+                            manifest_writer.writerow(
+                                {
+                                    "cycle_id": cycle_index,
+                                    "status": "complete",
+                                    "probe_file": f"probe/{cycle_name}",
+                                    "treatment_file": f"treatment/{cycle_name}",
+                                    "probe_captured_at": probe_time.isoformat(timespec="milliseconds"),
+                                    "treatment_captured_at": treatment_time.isoformat(timespec="milliseconds"),
+                                    "probe_vpp": f"{settings.probe_amplitude_vpp:.6g}",
+                                    "treatment_vpp": f"{settings.treatment_amplitude_vpp:.6g}",
+                                    "frequency_hz": f"{generator_settings.frequency_hz:.6g}",
+                                    "burst_cycles": generator_settings.burst_cycles,
+                                    "inter_burst_delay_ms": settings.inter_burst_delay_ms,
+                                    "cycle_period_ms": settings.cycle_period_ms,
+                                    "note": "",
+                                }
+                            )
+                            manifest_file.flush()
+                            probe_rms = float(np.std(probe_result.voltage_mv))
+                            treatment_rms = float(np.std(treatment_result.voltage_mv))
+                            self.log_message.emit(
+                                f"FUS–Probe cycle {cycle_index} saved: probe/treatment {cycle_name}; "
+                                f"RMS {probe_rms:.3f}/{treatment_rms:.3f} mV."
+                            )
+                        except Exception as exc:
+                            self._move_fus_probe_staging_files(staging_dir, failed_dir)
+                            manifest_writer.writerow(
+                                {
+                                    "cycle_id": cycle_index,
+                                    "status": "failed",
+                                    "probe_file": "",
+                                    "treatment_file": "",
+                                    "probe_captured_at": "",
+                                    "treatment_captured_at": "",
+                                    "probe_vpp": f"{settings.probe_amplitude_vpp:.6g}",
+                                    "treatment_vpp": f"{settings.treatment_amplitude_vpp:.6g}",
+                                    "frequency_hz": f"{generator_settings.frequency_hz:.6g}",
+                                    "burst_cycles": generator_settings.burst_cycles,
+                                    "inter_burst_delay_ms": settings.inter_burst_delay_ms,
+                                    "cycle_period_ms": settings.cycle_period_ms,
+                                    "note": str(exc),
+                                }
+                            )
+                            manifest_file.flush()
+                            raise
+
+                        elapsed_ms = 1000.0 * (time.perf_counter() - cycle_started)
+                        if elapsed_ms > settings.cycle_period_ms:
+                            self.log_message.emit(
+                                f"WARNING: FUS–Probe cycle {cycle_index} took {elapsed_ms:.1f} ms, "
+                                f"longer than the configured {settings.cycle_period_ms} ms period."
+                            )
+                        elif not self._sleep_with_stop(int(settings.cycle_period_ms - elapsed_ms)):
+                            break
+        finally:
+            try:
+                if generator.connected:
+                    generator.set_output(generator_settings.channel, False)
+                    self.log_message.emit("FUS–Probe signal generator output turned OFF.")
+            except Exception as exc:
+                self.log_message.emit(f"WARNING: unable to turn FUS–Probe signal generator output OFF: {exc}")
+            generator.close()
+            self._move_fus_probe_staging_files(staging_dir, failed_dir)
+            self.log_message.emit(f"FUS–Probe capture finished after {cycle_index} cycle(s).")
 
     def _sleep_with_stop(self, interval_ms: int) -> bool:
         deadline = time.time() + max(interval_ms, 0) / 1000.0
@@ -4004,6 +4336,7 @@ class MainWindow(QMainWindow):
         self.algorithm_combo = QComboBox()
         self.algorithm_combo.addItem("经典峰值法（SCD–ICD）", "scd_icd_peak_v1")
         self.algorithm_combo.addItem("IUD 窗内失稳分析", "iud_intrapulse_v1")
+        self.algorithm_combo.addItem("交替治疗–探测反馈（FUS–Probe）", "fus_probe_interleaved_v1")
 
         self.reference_no_edit = QLineEdit()
         self.reference_cav_edit = QLineEdit()
@@ -4069,6 +4402,23 @@ class MainWindow(QMainWindow):
         self.iud_fixed_f0_spin.setSuffix(" MHz")
         self.iud_fixed_f0_spin.setSpecialValueText("自动搜索")
 
+        self.fus_probe_amplitude_spin = QDoubleSpinBox()
+        self.fus_probe_amplitude_spin.setRange(0.001, 20.0)
+        self.fus_probe_amplitude_spin.setDecimals(3)
+        self.fus_probe_amplitude_spin.setSingleStep(0.1)
+        self.fus_probe_amplitude_spin.setSuffix(" Vpp")
+        self.fus_treatment_amplitude_spin = QDoubleSpinBox()
+        self.fus_treatment_amplitude_spin.setRange(0.001, 20.0)
+        self.fus_treatment_amplitude_spin.setDecimals(3)
+        self.fus_treatment_amplitude_spin.setSingleStep(0.1)
+        self.fus_treatment_amplitude_spin.setSuffix(" Vpp")
+        self.fus_probe_delay_spin = QSpinBox()
+        self.fus_probe_delay_spin.setRange(0, 10_000)
+        self.fus_probe_delay_spin.setSuffix(" ms")
+        self.fus_probe_cycle_period_spin = QSpinBox()
+        self.fus_probe_cycle_period_spin.setRange(100, 60_000)
+        self.fus_probe_cycle_period_spin.setSuffix(" ms")
+
         self.analysis_group = QGroupBox("PCD 分析设置")
         analysis_group_layout = QVBoxLayout(self.analysis_group)
         analysis_group_layout.setContentsMargins(8, 8, 8, 8)
@@ -4128,6 +4478,20 @@ class MainWindow(QMainWindow):
         iud_algorithm_form.addRow("失稳阈值", self.iud_threshold_spin)
         iud_algorithm_form.addRow("固定 f0", self.iud_fixed_f0_spin)
         self.algorithm_settings_stack.addWidget(iud_algorithm_group)
+
+        fus_probe_algorithm_group = QGroupBox("FUS–Probe 采集验证设置")
+        fus_probe_algorithm_form = QFormLayout(fus_probe_algorithm_group)
+        fus_probe_algorithm_form.addRow("探测电压", self.fus_probe_amplitude_spin)
+        fus_probe_algorithm_form.addRow("治疗电压", self.fus_treatment_amplitude_spin)
+        fus_probe_algorithm_form.addRow("探测后等待", self.fus_probe_delay_spin)
+        fus_probe_algorithm_form.addRow("周期", self.fus_probe_cycle_period_spin)
+        fus_probe_note = QLabel(
+            "仅支持 Hardware 真机模式。每周期按 Probe → Treatment 采集；"
+            "原始 CSV 将强制保存至本次运行目录的 probe/ 和 treatment/，并由 manifest.csv 一一配对。"
+        )
+        fus_probe_note.setWordWrap(True)
+        fus_probe_algorithm_form.addRow("说明", fus_probe_note)
+        self.algorithm_settings_stack.addWidget(fus_probe_algorithm_group)
         analysis_content_layout.addWidget(self.algorithm_settings_stack)
         analysis_group_layout.addWidget(self.analysis_content_widget)
         left_layout.addWidget(self.analysis_group)
@@ -4141,11 +4505,16 @@ class MainWindow(QMainWindow):
         self.max_live_points_spin.setSingleStep(10)
         self.show_reference_points_check = QCheckBox("显示 reference points")
 
-        display_group = QGroupBox("显示设置")
-        display_form = QFormLayout(display_group)
+        self.display_group = QGroupBox("显示设置")
+        display_form = QFormLayout(self.display_group)
         display_form.addRow("最大实时点数", self.max_live_points_spin)
         display_form.addRow("", self.show_reference_points_check)
-        left_layout.addWidget(display_group)
+        left_layout.addWidget(self.display_group)
+
+        # Keep surplus height at the bottom of the scrolling settings panel.
+        # Without this stretch, Qt distributes it across the collapsed groups,
+        # visually centering their headers and action buttons.
+        left_layout.addStretch(1)
 
         self.import_settings_button = QPushButton("导入设置")
         self.import_settings_button.clicked.connect(self._import_settings_profile)
@@ -4314,6 +4683,27 @@ class MainWindow(QMainWindow):
         iud_result_layout.addWidget(iud_log_group, stretch=1)
         self.algorithm_result_stack.addWidget(iud_result_page)
 
+        fus_probe_result_page = QWidget()
+        fus_probe_result_layout = QVBoxLayout(fus_probe_result_page)
+        fus_probe_result_layout.setContentsMargins(8, 8, 8, 8)
+        fus_probe_result_layout.setSpacing(10)
+        fus_probe_status_group = QGroupBox("FUS–Probe 采集验证")
+        fus_probe_status_layout = QVBoxLayout(fus_probe_status_group)
+        fus_probe_status_label = QLabel(
+            "当前阶段仅验证发生器的 Probe → Treatment 自动切换、ART 触发采集和文件配对。\n"
+            "分析、回放和闭环控制将在采集验证通过后再加入。"
+        )
+        fus_probe_status_label.setWordWrap(True)
+        fus_probe_status_layout.addWidget(fus_probe_status_label)
+        fus_probe_result_layout.addWidget(fus_probe_status_group)
+        fus_probe_log_group = QGroupBox("日志")
+        fus_probe_log_layout = QVBoxLayout(fus_probe_log_group)
+        self.fus_probe_log_output = QPlainTextEdit()
+        self.fus_probe_log_output.setReadOnly(True)
+        fus_probe_log_layout.addWidget(self.fus_probe_log_output)
+        fus_probe_result_layout.addWidget(fus_probe_log_group, stretch=1)
+        self.algorithm_result_stack.addWidget(fus_probe_result_page)
+
         contrast_result_page = QWidget()
         contrast_result_layout = QVBoxLayout(contrast_result_page)
         contrast_result_layout.setContentsMargins(8, 8, 8, 8)
@@ -4334,7 +4724,7 @@ class MainWindow(QMainWindow):
         contrast_result_layout.addWidget(contrast_log_group, stretch=2)
         self.algorithm_result_stack.addWidget(contrast_result_page)
 
-        self.log_outputs = [self.log_output, self.iud_log_output, self.contrast_log_output]
+        self.log_outputs = [self.log_output, self.iud_log_output, self.fus_probe_log_output, self.contrast_log_output]
         right_panel_layout.addWidget(self.algorithm_result_stack)
 
         self.algorithm_combo.currentIndexChanged.connect(self._on_algorithm_changed)
@@ -4468,7 +4858,7 @@ class MainWindow(QMainWindow):
             return
         self.algorithm_settings_stack.setCurrentIndex(index)
         if self.mode_combo.currentData() == "contrast":
-            self.algorithm_result_stack.setCurrentIndex(2)
+            self.algorithm_result_stack.setCurrentIndex(3)
         else:
             self.algorithm_result_stack.setCurrentIndex(index)
         uses_reference_database = self.algorithm_combo.currentData() == "scd_icd_peak_v1"
@@ -4585,6 +4975,10 @@ class MainWindow(QMainWindow):
         self.iud_threshold_spin.setValue(settings.iud.instability_threshold_db)
         self.iud_normal_reference_spin.setValue(settings.iud.normal_reference_db)
         self.iud_fixed_f0_spin.setValue(settings.iud.fixed_f0_hz / 1e6)
+        self.fus_probe_amplitude_spin.setValue(settings.fus_probe.probe_amplitude_vpp)
+        self.fus_treatment_amplitude_spin.setValue(settings.fus_probe.treatment_amplitude_vpp)
+        self.fus_probe_delay_spin.setValue(settings.fus_probe.inter_burst_delay_ms)
+        self.fus_probe_cycle_period_spin.setValue(settings.fus_probe.cycle_period_ms)
         self.max_live_points_spin.setValue(settings.ui.max_live_points)
         self.show_reference_points_check.setChecked(settings.ui.show_reference_points)
         self.scatter_widget.set_show_reference_points(settings.ui.show_reference_points)
@@ -4619,6 +5013,13 @@ class MainWindow(QMainWindow):
             fixed_f0_hz=self.iud_fixed_f0_spin.value() * 1e6,
         )
         iud_settings.validate(self.points_spin.value())
+        fus_probe_settings = FusProbeSettings(
+            probe_amplitude_vpp=self.fus_probe_amplitude_spin.value(),
+            treatment_amplitude_vpp=self.fus_treatment_amplitude_spin.value(),
+            inter_burst_delay_ms=self.fus_probe_delay_spin.value(),
+            cycle_period_ms=self.fus_probe_cycle_period_spin.value(),
+        )
+        fus_probe_settings.validate()
 
         return AppSettings(
             hardware=HardwareSettings(
@@ -4662,6 +5063,7 @@ class MainWindow(QMainWindow):
             ),
             analysis=analysis_settings,
             iud=iud_settings,
+            fus_probe=fus_probe_settings,
             ui=UiSettings(
                 last_mode=self.mode_combo.currentData(),
                 max_live_points=self.max_live_points_spin.value(),
@@ -4677,14 +5079,19 @@ class MainWindow(QMainWindow):
         is_hardware = current_mode == "hardware"
         is_playback = current_mode == "playback"
         is_contrast = current_mode == "contrast"
-        self.playback_group.setEnabled(is_playback)
-        self.hardware_group.setEnabled(is_hardware)
-        self.signal_generator_group.setEnabled(is_hardware)
-        self.contrast_group.setEnabled(is_contrast)
+
+        # Each running mode owns a distinct workflow.  Hiding settings that do
+        # not apply keeps the left panel compact and avoids accidental edits.
+        self.playback_group.setVisible(is_playback)
+        self.hardware_group.setVisible(is_hardware)
+        self.signal_generator_group.setVisible(is_hardware)
+        self.contrast_group.setVisible(is_contrast)
+        self.display_group.setVisible(not is_contrast)
         self.contrast_progress_bar.setVisible(is_contrast)
         self.contrast_progress_label.setVisible(is_contrast)
+        self.clear_button.setText("清空对比结果" if is_contrast else "清空实时点")
         if is_contrast:
-            self.algorithm_result_stack.setCurrentIndex(2)
+            self.algorithm_result_stack.setCurrentIndex(3)
         else:
             self.algorithm_result_stack.setCurrentIndex(max(self.algorithm_combo.currentIndex(), 0))
         self._set_playback_ui_state(self.playback_state)
@@ -5109,6 +5516,7 @@ class MainWindow(QMainWindow):
             imported_settings = load_app_settings_from_path(Path(file_path))
             imported_settings.analysis.validate()
             imported_settings.iud.validate(imported_settings.analysis.target_sample_count)
+            imported_settings.fus_probe.validate()
             self.settings = imported_settings
             self._apply_settings_to_ui(imported_settings)
             self._update_mode_visibility()
@@ -5130,7 +5538,29 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "配置错误", str(exc))
             return
 
-        if self.settings.ui.last_mode == "hardware":
+        is_fus_probe_capture = (
+            self.settings.ui.last_mode == "hardware"
+            and self.settings.analysis.algorithm_id == "fus_probe_interleaved_v1"
+        )
+        if is_fus_probe_capture:
+            if not self.signal_generator_client.connected:
+                QMessageBox.warning(
+                    self,
+                    "需要信号发生器",
+                    "交替治疗–探测反馈必须自动控制信号发生器。请先连接 DG1062 后再开始。",
+                )
+                self.append_log("FUS–Probe start blocked: signal generator is not connected.")
+                return
+            if not self._set_signal_generator_output(False):
+                QMessageBox.warning(self, "输出关闭失败", "无法确认信号发生器输出已关闭，已取消 FUS–Probe 采集。")
+                return
+            self.signal_generator_client.disconnect()
+            self._set_signal_connection_visual(False)
+            self.signal_generator_output_is_on = None
+            self._update_signal_generator_output_buttons()
+            self.signal_identity_label.setText("FUS–Probe worker 接管中")
+            self.append_log("FUS–Probe worker will take exclusive control of the signal generator.")
+        elif self.settings.ui.last_mode == "hardware":
             if not self.signal_generator_client.connected:
                 self.append_log(
                     "Signal generator is not connected. Skipping automatic configuration; "
@@ -5210,7 +5640,9 @@ class MainWindow(QMainWindow):
         if self.worker is not None:
             self.worker.stop()
             if self.settings.ui.last_mode == "hardware":
-                if self.signal_generator_client.connected:
+                if self.settings.analysis.algorithm_id == "fus_probe_interleaved_v1":
+                    self.append_log("FUS–Probe stop requested. The worker will close generator output after the active capture.")
+                elif self.signal_generator_client.connected:
                     self.append_log(
                         "Stop requested. Signal generator will stay ON until the current acquisition finishes."
                     )
@@ -5315,6 +5747,11 @@ class MainWindow(QMainWindow):
         if self.settings.ui.last_mode == "hardware" and self.signal_generator_client.connected:
             if self._set_signal_generator_output(False):
                 self.append_log("Signal generator output turned OFF after acquisition finished.")
+        if self.settings.analysis.algorithm_id == "fus_probe_interleaved_v1":
+            self._set_signal_connection_visual(False)
+            self.signal_generator_output_is_on = None
+            self._update_signal_generator_output_buttons()
+            self.signal_identity_label.setText("未连接（FUS–Probe 采集已结束）")
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
         self.algorithm_combo.setEnabled(True)
