@@ -550,7 +550,10 @@ class SignalGeneratorClient:
         resource_name = resource_name.strip()
         if not resource_name:
             raise SignalGeneratorError("请先选择或输入 VISA 资源地址。")
-        self.disconnect()
+        # A FUS-Probe worker owns a separate VISA session and closes it when the
+        # run ends. Recreate the GUI-side manager here instead of reusing a
+        # native VISA handle that may have become invalid in the meantime.
+        self.close()
         try:
             instrument = self._get_resource_manager().open_resource(resource_name)
             instrument.timeout = int(timeout_ms)
@@ -5342,7 +5345,7 @@ class MainWindow(QMainWindow):
             )
 
     def _disconnect_signal_generator(self) -> None:
-        self.signal_generator_client.disconnect()
+        self.signal_generator_client.close()
         self._set_signal_connection_visual(False)
         self.signal_generator_output_is_on = None
         self._update_signal_generator_output_buttons()
@@ -5554,7 +5557,7 @@ class MainWindow(QMainWindow):
             if not self._set_signal_generator_output(False):
                 QMessageBox.warning(self, "输出关闭失败", "无法确认信号发生器输出已关闭，已取消 FUS–Probe 采集。")
                 return
-            self.signal_generator_client.disconnect()
+            self.signal_generator_client.close()
             self._set_signal_connection_visual(False)
             self.signal_generator_output_is_on = None
             self._update_signal_generator_output_buttons()
