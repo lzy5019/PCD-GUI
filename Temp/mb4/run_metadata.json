@@ -1,0 +1,83 @@
+{
+  "run_started_at": "2026-07-12T17:27:53.384",
+  "algorithm": "fus_probe_interleaved_v1",
+  "sequence": "probe_then_treatment",
+  "signal_generator": {
+    "resource_name": "USB0::0x1AB1::0x0642::DG1ZA183201862::INSTR",
+    "timeout_ms": 3000,
+    "channel": 1,
+    "frequency_hz": 612000.0,
+    "amplitude_vpp": 7.0,
+    "offset_v": 0.0,
+    "load": "INF",
+    "prf_hz": 1.0,
+    "burst_cycles": 6000
+  },
+  "fus_probe": {
+    "uhe_be_settings_revision": 3,
+    "probe_amplitude_vpp": 4.5,
+    "treatment_amplitude_vpp": 7.0,
+    "inter_burst_delay_ms": 200,
+    "cycle_period_ms": 1000,
+    "ultraharmonic_orders": [
+      1.5,
+      2.5,
+      3.5
+    ],
+    "spectral_half_width_hz": 10000.0,
+    "exclusion_half_width_hz": 30000.0,
+    "broadband_low_order": 1.25,
+    "broadband_high_order": 6.25,
+    "probe_quality_threshold_db": 12.0,
+    "uhe_system_correction_db": -3.8,
+    "be_system_correction_db": -3.8,
+    "uhe_activation_threshold_db": 3.0,
+    "uhe_minimum_confirmed_bands": 3,
+    "be_risk_threshold_db": 6.0,
+    "open_dose_threshold": 500.0,
+    "thresholds_calibrated": false,
+    "show_uhe_curve": true,
+    "show_be_curve": true,
+    "show_dose_curve": true
+  },
+  "hardware": {
+    "dll_path": "vendor/ACTS1000_64.dll",
+    "device_id": 0,
+    "sample_rate_hz": 25000000.0,
+    "points": 50000,
+    "input_range": "pm1000",
+    "input_impedance": "1m",
+    "trigger_source": "dtr",
+    "timeout_seconds": 2.0,
+    "save_csv": true,
+    "output_dir": "Temp"
+  },
+  "burst_duration_ms": 9.803921568627452,
+  "capture_window_ms": 2.0,
+  "feature_algorithm": {
+    "version": "fus_probe_uhe_be_v4",
+    "feature_settings": {
+      "ultraharmonic_orders": [
+        1.5,
+        2.5,
+        3.5
+      ],
+      "spectral_half_width_hz": 10000.0,
+      "exclusion_half_width_hz": 30000.0,
+      "broadband_low_order": 1.25,
+      "broadband_high_order": 6.25,
+      "probe_quality_threshold_db": 12.0,
+      "clipping_fraction_threshold": 0.001,
+      "uhe_system_correction_db": -3.8,
+      "be_system_correction_db": -3.8
+    },
+    "decision_settings": {
+      "uhe_activation_threshold_db": 3.0,
+      "uhe_minimum_confirmed_bands": 3,
+      "be_risk_threshold_db": 6.0,
+      "open_dose_threshold": 500.0,
+      "thresholds_calibrated": false
+    },
+    "threshold_notice": "Exploratory thresholds only; no BBB-opening or damage endpoint calibration."
+  }
+}

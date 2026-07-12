@@ -18,6 +18,15 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 import numpy as np
+from fus_probe_algorithm import (
+    ALGORITHM_VERSION as FUS_PROBE_ALGORITHM_VERSION,
+    FusProbeDecision,
+    FusProbeDecisionSettings,
+    FusProbeDoseTracker,
+    FusProbeFeatureSettings,
+    FusProbePairMetrics,
+    analyze_fus_probe_pair,
+)
 from PyQt5.QtCore import QObject, QRect, Qt, QThread, pyqtSignal, pyqtSlot
 from PyQt5.QtGui import QColor, QPainter, QPen
 from PyQt5.QtWidgets import (
@@ -39,6 +48,7 @@ from PyQt5.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QSplitter,
     QStackedWidget,
@@ -318,8 +328,13 @@ class SignalGeneratorSettings:
 @dataclass
 class PlaybackSettings:
     source_patterns: list[str] = field(default_factory=lambda: ["data/playback/*.csv"])
+    target_sample_count: int = 25_000
     interval_ms: int = 300
     loop_playback: bool = False
+
+    def validate(self) -> None:
+        if self.target_sample_count < 512:
+            raise ValueError("Playback sample count must be at least 512.")
 
 
 @dataclass
@@ -447,10 +462,27 @@ class IudSettings:
 
 @dataclass
 class FusProbeSettings:
+    uhe_be_settings_revision: int = 3
     probe_amplitude_vpp: float = 4.5
     treatment_amplitude_vpp: float = 7.0
     inter_burst_delay_ms: int = 200
     cycle_period_ms: int = 1000
+    ultraharmonic_orders: list[float] = field(default_factory=lambda: [1.5, 2.5, 3.5])
+    spectral_half_width_hz: float = 10_000.0
+    exclusion_half_width_hz: float = 30_000.0
+    broadband_low_order: float = 1.25
+    broadband_high_order: float = 6.25
+    probe_quality_threshold_db: float = 12.0
+    uhe_system_correction_db: float = -3.8
+    be_system_correction_db: float = -3.8
+    uhe_activation_threshold_db: float = 3.0
+    uhe_minimum_confirmed_bands: int = 3
+    be_risk_threshold_db: float = 6.0
+    open_dose_threshold: float = 20.0
+    thresholds_calibrated: bool = False
+    show_uhe_curve: bool = True
+    show_be_curve: bool = True
+    show_dose_curve: bool = True
 
     def validate(self) -> None:
         if self.probe_amplitude_vpp <= 0:
@@ -463,6 +495,32 @@ class FusProbeSettings:
             raise ValueError("FUS–Probe cycle period must be at least 100 ms.")
         if self.inter_burst_delay_ms >= self.cycle_period_ms:
             raise ValueError("FUS–Probe inter-burst delay must be shorter than the cycle period.")
+        if not 1 <= self.uhe_minimum_confirmed_bands <= len(self.ultraharmonic_orders):
+            raise ValueError("FUS–Probe UHE confirmation band count is outside the configured UHE order count.")
+        feature_settings = self.feature_settings()
+        feature_settings.validate()
+        self.decision_settings().validate()
+
+    def feature_settings(self) -> FusProbeFeatureSettings:
+        return FusProbeFeatureSettings(
+            ultraharmonic_orders=tuple(float(value) for value in self.ultraharmonic_orders),
+            spectral_half_width_hz=float(self.spectral_half_width_hz),
+            exclusion_half_width_hz=float(self.exclusion_half_width_hz),
+            broadband_low_order=float(self.broadband_low_order),
+            broadband_high_order=float(self.broadband_high_order),
+            probe_quality_threshold_db=float(self.probe_quality_threshold_db),
+            uhe_system_correction_db=float(self.uhe_system_correction_db),
+            be_system_correction_db=float(self.be_system_correction_db),
+        )
+
+    def decision_settings(self) -> FusProbeDecisionSettings:
+        return FusProbeDecisionSettings(
+            uhe_activation_threshold_db=float(self.uhe_activation_threshold_db),
+            uhe_minimum_confirmed_bands=int(self.uhe_minimum_confirmed_bands),
+            be_risk_threshold_db=float(self.be_risk_threshold_db),
+            open_dose_threshold=float(self.open_dose_threshold),
+            thresholds_calibrated=bool(self.thresholds_calibrated),
+        )
 
 
 @dataclass
@@ -492,15 +550,36 @@ class AppSettings:
 
     @classmethod
     def from_dict(cls, data: dict) -> "AppSettings":
+        playback_data = dict(data.get("playback", {}))
+        if "target_sample_count" not in playback_data:
+            playback_data["target_sample_count"] = data.get("analysis", {}).get(
+                "target_sample_count", 25_000
+            )
+        fus_probe_data = dict(data.get("fus_probe", {}))
+        if "spectral_half_width_hz" not in fus_probe_data and "harmonic_half_width_hz" in fus_probe_data:
+            fus_probe_data["spectral_half_width_hz"] = fus_probe_data["harmonic_half_width_hz"]
+        if (
+            int(fus_probe_data.get("uhe_be_settings_revision", 0)) < 2
+            and not bool(fus_probe_data.get("thresholds_calibrated", False))
+        ):
+            # The previous exploratory UHE default was inside the background tail.
+            fus_probe_data["uhe_activation_threshold_db"] = 3.0
+        fus_probe_data["uhe_be_settings_revision"] = 3
         return cls(
             hardware=HardwareSettings(**data.get("hardware", {})),
             signal_generator=SignalGeneratorSettings(**data.get("signal_generator", {})),
-            playback=PlaybackSettings(**data.get("playback", {})),
+            playback=PlaybackSettings(**playback_data),
             contrast=ContrastSettings(**data.get("contrast", {})),
             reference=ReferenceSettings(**data.get("reference", {})),
             analysis=AnalysisSettings.from_dict(data.get("analysis", {})),
             iud=IudSettings(**data.get("iud", {})),
-            fus_probe=FusProbeSettings(**data.get("fus_probe", {})),
+            fus_probe=FusProbeSettings(
+                **{
+                    key: value
+                    for key, value in fus_probe_data.items()
+                    if key in {item.name for item in fields(FusProbeSettings)}
+                }
+            ),
             ui=UiSettings(**data.get("ui", {})),
         )
 
@@ -918,6 +997,14 @@ class AnalysisFrame:
 
 
 @dataclass
+class FusProbeAnalysisFrame:
+    cycle_id: int
+    captured_at: datetime
+    metrics: FusProbePairMetrics
+    decision: FusProbeDecision
+
+
+@dataclass
 class PlaybackUiState:
     is_active: bool = False
     is_paused: bool = False
@@ -1284,6 +1371,34 @@ def resolve_input_patterns(patterns: list[str]) -> list[Path]:
             seen.add(key)
             deduplicated.append(file_path.resolve())
     return deduplicated
+
+
+def resolve_fus_probe_run_dirs(patterns: list[str]) -> list[Path]:
+    run_dirs: list[Path] = []
+    seen: set[str] = set()
+    for raw_pattern in patterns:
+        pattern = raw_pattern.strip()
+        if not pattern:
+            continue
+        path = Path(pattern)
+        candidate_path = path if path.is_absolute() else workspace_root() / path
+        if not glob.has_magic(str(candidate_path)) and candidate_path.exists():
+            matched_paths = [candidate_path]
+        else:
+            matched_paths = [Path(match) for match in sorted(glob.glob(str(candidate_path)))]
+        for matched_path in matched_paths:
+            candidates = [matched_path.parent] if matched_path.name.lower() == "manifest.csv" else []
+            if matched_path.is_dir() and (matched_path / "manifest.csv").exists():
+                candidates.append(matched_path)
+            if (matched_path.parent / "manifest.csv").exists():
+                candidates.append(matched_path.parent)
+            for candidate in candidates:
+                resolved = candidate.resolve()
+                key = str(resolved).lower()
+                if key not in seen:
+                    seen.add(key)
+                    run_dirs.append(resolved)
+    return run_dirs
 
 
 def parse_contrast_index(raw_text: str, default: int | None, allow_open_end: bool = False) -> int | None:
@@ -2582,6 +2697,299 @@ class IudTreatmentTrendWidget(QWidget):
                 painter.drawText(chart_rect.left() + 8, chart_rect.top() + 18, label)
 
 
+class FusProbeTrendWidget(QWidget):
+    STATE_COLORS = {
+        "invalid": QColor("#64748b"),
+        "not_open": QColor("#2563eb"),
+        "open": QColor("#16a34a"),
+        "risk": QColor("#dc2626"),
+    }
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.cycles = np.asarray([], dtype=float)
+        self.uhe_db = np.asarray([], dtype=float)
+        self.be_db = np.asarray([], dtype=float)
+        self.dose = np.asarray([], dtype=float)
+        self.states: list[str] = []
+        self.uhe_threshold_db = 3.0
+        self.be_threshold_db = 6.0
+        self.open_dose_threshold = 20.0
+        self.show_uhe = True
+        self.show_be = True
+        self.show_dose = True
+        self.setMinimumHeight(230)
+        self.setStyleSheet("background: white;")
+
+    def set_thresholds(self, settings: FusProbeSettings) -> None:
+        self.uhe_threshold_db = settings.uhe_activation_threshold_db
+        self.be_threshold_db = settings.be_risk_threshold_db
+        self.open_dose_threshold = settings.open_dose_threshold
+        self.update()
+
+    def set_visible_series(
+        self,
+        *,
+        show_uhe: bool,
+        show_be: bool,
+        show_dose: bool,
+    ) -> None:
+        self.show_uhe = bool(show_uhe)
+        self.show_be = bool(show_be)
+        self.show_dose = bool(show_dose)
+        self.update()
+
+    def clear_data(self) -> None:
+        self.cycles = np.asarray([], dtype=float)
+        self.uhe_db = np.asarray([], dtype=float)
+        self.be_db = np.asarray([], dtype=float)
+        self.dose = np.asarray([], dtype=float)
+        self.states = []
+        self.update()
+
+    def add_frame(self, frame: FusProbeAnalysisFrame, max_points: int) -> None:
+        self.cycles = np.append(self.cycles, float(frame.cycle_id))
+        self.uhe_db = np.append(self.uhe_db, frame.metrics.uhe_db)
+        self.be_db = np.append(self.be_db, frame.metrics.be_db)
+        self.dose = np.append(self.dose, frame.decision.cumulative_safe_uhe_dose)
+        self.states.append(frame.decision.state)
+        limit = max(1, int(max_points))
+        if self.cycles.size > limit:
+            remove_count = self.cycles.size - limit
+            self.cycles = self.cycles[remove_count:]
+            self.uhe_db = self.uhe_db[remove_count:]
+            self.be_db = self.be_db[remove_count:]
+            self.dose = self.dose[remove_count:]
+            self.states = self.states[remove_count:]
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.fillRect(self.rect(), QColor("#ffffff"))
+        emission_rect = self.rect().adjusted(68, 34, -26, -116 if self.show_dose else -38)
+        dose_rect = None
+        if self.show_dose:
+            dose_rect = QRect(
+                emission_rect.left(),
+                emission_rect.bottom() + 34,
+                emission_rect.width(),
+                max(58, self.height() - emission_rect.bottom() - 62),
+            )
+        painter.setPen(QPen(QColor("#d0d7de"), 1))
+        painter.drawRect(emission_rect)
+        if dose_rect is not None:
+            painter.drawRect(dose_rect)
+        painter.setPen(QPen(QColor("#111827"), 1))
+        painter.drawText(emission_rect.left(), 20, "Probe-normalized UHE / BE")
+        painter.drawText(10, emission_rect.top() + 14, "dB")
+        if dose_rect is not None:
+            painter.drawText(10, dose_rect.top() + 14, "Dose")
+
+        legend = tuple(
+            item
+            for item in (
+                ("UHE", QColor("#7c3aed"), self.show_uhe),
+                ("BE", QColor("#ea580c"), self.show_be),
+            )
+            if item[2]
+        )
+        legend_x = emission_rect.right() - max(0, len(legend) * 56)
+        for index, (label, color, _) in enumerate(legend):
+            x = legend_x + index * 56
+            painter.setPen(QPen(color, 2))
+            painter.drawLine(x, 18, x + 16, 18)
+            painter.setPen(QPen(QColor("#111827"), 1))
+            painter.drawText(x + 20, 22, label)
+
+        if self.cycles.size == 0:
+            painter.drawText(emission_rect.center().x() - 64, emission_rect.center().y(), "No paired features yet")
+            return
+
+        x_min = float(self.cycles[0])
+        x_max = float(self.cycles[-1])
+        if x_max <= x_min:
+            x_max = x_min + 1.0
+        visible_emission_series = tuple(
+            (values, color)
+            for values, color, visible in (
+                (self.uhe_db, QColor("#7c3aed"), self.show_uhe),
+                (self.be_db, QColor("#ea580c"), self.show_be),
+            )
+            if visible
+        )
+        finite_parts = [values[np.isfinite(values)] for values, _ in visible_emission_series]
+        finite_parts = [values for values in finite_parts if values.size]
+        if finite_parts:
+            finite_emissions = np.concatenate(finite_parts)
+            y_min = min(-6.0, float(np.floor(np.min(finite_emissions) / 2.0) * 2.0))
+            y_max = max(
+                self.be_threshold_db + 2.0 if self.show_be else -math.inf,
+                self.uhe_threshold_db + 2.0 if self.show_uhe else -math.inf,
+                float(np.ceil(np.max(finite_emissions) / 2.0) * 2.0),
+            )
+        else:
+            y_min, y_max = -6.0, 8.0
+        dose_max = max(
+            self.open_dose_threshold * 1.15,
+            float(np.max(self.dose)) * 1.1,
+            1.0,
+        )
+
+        def x_pixel(value: float) -> float:
+            return emission_rect.left() + (value - x_min) / (x_max - x_min) * emission_rect.width()
+
+        def emission_y(value: float) -> float:
+            return emission_rect.bottom() - (value - y_min) / (y_max - y_min) * emission_rect.height()
+
+        def dose_y(value: float) -> float:
+            assert dose_rect is not None
+            return dose_rect.bottom() - value / dose_max * dose_rect.height()
+
+        painter.setPen(QPen(QColor("#e5e7eb"), 1, Qt.DashLine))
+        for tick in range(5):
+            ratio = tick / 4
+            y = emission_rect.bottom() - ratio * emission_rect.height()
+            painter.drawLine(emission_rect.left(), int(y), emission_rect.right(), int(y))
+            value = y_min + ratio * (y_max - y_min)
+            painter.setPen(QPen(QColor("#111827"), 1))
+            painter.drawText(16, int(y) + 4, f"{value:.0f}")
+            painter.setPen(QPen(QColor("#e5e7eb"), 1, Qt.DashLine))
+
+        for threshold, color, label, visible in (
+            (self.uhe_threshold_db, QColor("#7c3aed"), "UHE active", self.show_uhe),
+            (self.be_threshold_db, QColor("#ea580c"), "BE risk", self.show_be),
+        ):
+            if visible and y_min <= threshold <= y_max:
+                y = emission_y(threshold)
+                painter.setPen(QPen(color, 1, Qt.DashLine))
+                painter.drawLine(emission_rect.left(), int(y), emission_rect.right(), int(y))
+                painter.drawText(emission_rect.right() - 80, int(y) - 3, label)
+
+        for values, color in visible_emission_series:
+            painter.setPen(QPen(color, 2))
+            for index in range(1, values.size):
+                if not math.isfinite(float(values[index - 1])) or not math.isfinite(float(values[index])):
+                    continue
+                painter.drawLine(
+                    int(x_pixel(float(self.cycles[index - 1]))),
+                    int(emission_y(float(values[index - 1]))),
+                    int(x_pixel(float(self.cycles[index]))),
+                    int(emission_y(float(values[index]))),
+                )
+
+        if visible_emission_series:
+            for cycle, state in zip(self.cycles, self.states):
+                color = self.STATE_COLORS.get(state, QColor("#64748b"))
+                x = x_pixel(float(cycle))
+                painter.fillRect(QRect(int(x) - 3, emission_rect.top() + 4, 6, 6), color)
+        else:
+            painter.drawText(emission_rect.center().x() - 60, emission_rect.center().y(), "Emission traces hidden")
+
+        if dose_rect is not None:
+            painter.setPen(QPen(QColor("#2563eb"), 2))
+            for index in range(1, self.dose.size):
+                painter.drawLine(
+                    int(x_pixel(float(self.cycles[index - 1]))),
+                    int(dose_y(float(self.dose[index - 1]))),
+                    int(x_pixel(float(self.cycles[index]))),
+                    int(dose_y(float(self.dose[index]))),
+                )
+            threshold_y = dose_y(self.open_dose_threshold)
+            painter.setPen(QPen(QColor("#16a34a"), 1, Qt.DashLine))
+            painter.drawLine(dose_rect.left(), int(threshold_y), dose_rect.right(), int(threshold_y))
+            painter.drawText(dose_rect.right() - 110, int(threshold_y) - 3, "candidate open dose")
+        painter.setPen(QPen(QColor("#111827"), 1))
+        painter.drawText(dose_rect.center().x() - 20, self.height() - 10, "Cycle")
+
+
+class FusProbeSpectrumOverlayWidget(QWidget):
+    def __init__(self) -> None:
+        super().__init__()
+        self.metrics: FusProbePairMetrics | None = None
+        self.setMinimumHeight(165)
+        self.setStyleSheet("background: white;")
+
+    def clear_data(self) -> None:
+        self.metrics = None
+        self.update()
+
+    def set_metrics(self, metrics: FusProbePairMetrics) -> None:
+        self.metrics = metrics
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.fillRect(self.rect(), QColor("#ffffff"))
+        chart_rect = self.rect().adjusted(72, 30, -26, -46)
+        painter.setPen(QPen(QColor("#d0d7de"), 1))
+        painter.drawRect(chart_rect)
+        painter.setPen(QPen(QColor("#111827"), 1))
+        painter.drawText(chart_rect.left(), 18, "Latest Probe / Treatment drive-normalized PSD")
+        if self.metrics is None or self.metrics.frequency_hz.size == 0:
+            painter.drawText(chart_rect.center().x() - 62, chart_rect.center().y(), "No paired spectrum yet")
+            return
+
+        metrics = self.metrics
+        mask = (metrics.frequency_hz >= 0.5e6) & (metrics.frequency_hz <= 4.0e6)
+        x_values = metrics.frequency_hz[mask] / 1e6
+        probe_db = 10.0 * np.log10(
+            np.maximum(metrics.probe_psd[mask] / max(metrics.probe_vpp**2, FLOAT_EPS), FLOAT_EPS)
+        )
+        treatment_db = 10.0 * np.log10(
+            np.maximum(metrics.treatment_psd[mask] / max(metrics.treatment_vpp**2, FLOAT_EPS), FLOAT_EPS)
+        )
+        y_max = float(np.ceil(max(np.max(probe_db), np.max(treatment_db)) / 10.0) * 10.0)
+        y_min = y_max - 90.0
+        x_min = float(x_values[0])
+        x_max = float(x_values[-1])
+
+        def to_pixel(x_value: float, y_value: float) -> tuple[float, float]:
+            return (
+                chart_rect.left() + (x_value - x_min) / (x_max - x_min) * chart_rect.width(),
+                chart_rect.bottom() - (y_value - y_min) / (y_max - y_min) * chart_rect.height(),
+            )
+
+        painter.setPen(QPen(QColor("#e5e7eb"), 1, Qt.DashLine))
+        for tick in range(6):
+            ratio = tick / 5
+            x = chart_rect.left() + ratio * chart_rect.width()
+            y = chart_rect.bottom() - ratio * chart_rect.height()
+            painter.drawLine(int(x), chart_rect.top(), int(x), chart_rect.bottom())
+            painter.drawLine(chart_rect.left(), int(y), chart_rect.right(), int(y))
+            painter.setPen(QPen(QColor("#111827"), 1))
+            painter.drawText(int(x) - 12, chart_rect.bottom() + 18, f"{x_min + ratio * (x_max - x_min):.1f}")
+            painter.drawText(12, int(y) + 4, f"{y_min + ratio * (y_max - y_min):.0f}")
+            painter.setPen(QPen(QColor("#e5e7eb"), 1, Qt.DashLine))
+
+        step = max(1, int(math.ceil(x_values.size / max(chart_rect.width(), 1))))
+        for values, color in ((probe_db, QColor("#2563eb")), (treatment_db, QColor("#dc2626"))):
+            painter.setPen(QPen(color, 1.5))
+            sampled_x = x_values[::step]
+            sampled_y = values[::step]
+            for index in range(1, sampled_x.size):
+                x1, y1 = to_pixel(float(sampled_x[index - 1]), float(sampled_y[index - 1]))
+                x2, y2 = to_pixel(float(sampled_x[index]), float(sampled_y[index]))
+                painter.drawLine(int(x1), int(y1), int(x2), int(y2))
+        for order in metrics.ultraharmonic_orders:
+            ultraharmonic_mhz = order * metrics.f0_hz / 1e6
+            if x_min <= ultraharmonic_mhz <= x_max:
+                x, _ = to_pixel(ultraharmonic_mhz, y_min)
+                painter.setPen(QPen(QColor("#7c3aed"), 1, Qt.DotLine))
+                painter.drawLine(int(x), chart_rect.top(), int(x), chart_rect.bottom())
+                painter.drawText(int(x) + 2, chart_rect.top() + 28, f"U{order:g}")
+        painter.setPen(QPen(QColor("#2563eb"), 2))
+        painter.drawLine(chart_rect.right() - 150, 18, chart_rect.right() - 132, 18)
+        painter.setPen(QPen(QColor("#111827"), 1))
+        painter.drawText(chart_rect.right() - 128, 22, "Probe")
+        painter.setPen(QPen(QColor("#dc2626"), 2))
+        painter.drawLine(chart_rect.right() - 75, 18, chart_rect.right() - 57, 18)
+        painter.setPen(QPen(QColor("#111827"), 1))
+        painter.drawText(chart_rect.right() - 53, 22, "Treatment")
+        painter.drawText(chart_rect.center().x() - 44, self.height() - 10, "Frequency (MHz)")
+
+
 class PcdScatterWidget(QWidget):
     def __init__(self) -> None:
         super().__init__()
@@ -3283,6 +3691,7 @@ class AcquisitionWorker(QObject):
     contrast_point_ready = pyqtSignal(object)
     contrast_progress_changed = pyqtSignal(object)
     playback_state_changed = pyqtSignal(object)
+    fus_probe_pair_ready = pyqtSignal(object)
     error = pyqtSignal(str)
     finished = pyqtSignal()
 
@@ -3355,11 +3764,11 @@ class AcquisitionWorker(QObject):
                     f"threshold {self.settings.iud.instability_threshold_db:.1f} dB."
                 )
             elif self.settings.analysis.algorithm_id == "fus_probe_interleaved_v1":
-                if self.settings.ui.last_mode != "hardware":
-                    raise ValueError("交替治疗–探测反馈当前仅支持 Hardware 真机模式。")
+                if self.settings.ui.last_mode not in {"hardware", "playback"}:
+                    raise ValueError("交替治疗–探测反馈支持 Hardware 真机和配对 Playback 回放模式。")
                 self.settings.fus_probe.validate()
                 self.log_message.emit(
-                    "FUS–Probe capture validation ready: "
+                    f"FUS–Probe {FUS_PROBE_ALGORITHM_VERSION} ready: "
                     f"probe {self.settings.fus_probe.probe_amplitude_vpp:.3g} Vpp -> "
                     f"treatment {self.settings.fus_probe.treatment_amplitude_vpp:.3g} Vpp."
                 )
@@ -3374,6 +3783,8 @@ class AcquisitionWorker(QObject):
                 if reference_stats is None:
                     raise ValueError("Contrast mode requires SCD–ICD reference statistics.")
                 self._run_contrast(reference_stats)
+            elif self.settings.analysis.algorithm_id == "fus_probe_interleaved_v1":
+                self._run_fus_probe_playback()
             else:
                 self._run_playback(reference_stats)
         except Exception as exc:
@@ -3678,6 +4089,9 @@ class AcquisitionWorker(QObject):
             raise SignalGeneratorError("FUS–Probe 采集需要已配置的信号发生器 VISA 地址。")
 
         run_started_at = datetime.now()
+        run_started_monotonic = time.perf_counter()
+        feature_settings = settings.feature_settings()
+        dose_tracker = FusProbeDoseTracker(settings.decision_settings())
         run_dir = resolve_workspace_path(hardware.output_dir) / f"fus_probe_{run_started_at.strftime('%Y%m%d_%H%M%S')}"
         probe_dir = run_dir / "probe"
         treatment_dir = run_dir / "treatment"
@@ -3697,6 +4111,16 @@ class AcquisitionWorker(QObject):
             "hardware": asdict(hardware),
             "burst_duration_ms": burst_duration_ms,
             "capture_window_ms": capture_window_ms,
+            "feature_algorithm": {
+                "version": FUS_PROBE_ALGORITHM_VERSION,
+                "feature_settings": asdict(feature_settings),
+                "decision_settings": asdict(settings.decision_settings()),
+                "threshold_notice": (
+                    "Biological thresholds calibrated for this system."
+                    if settings.thresholds_calibrated
+                    else "Thresholds require BBB-opening and damage endpoint validation."
+                ),
+            },
         }
         with (run_dir / "run_metadata.json").open("w", encoding="utf-8") as metadata_file:
             json.dump(metadata, metadata_file, ensure_ascii=False, indent=2)
@@ -3744,6 +4168,15 @@ class AcquisitionWorker(QObject):
                         "burst_cycles",
                         "inter_burst_delay_ms",
                         "cycle_period_ms",
+                        "probe_quality_db",
+                        "uhe_db",
+                        "uhe_active_band_count",
+                        "uhe_confirmed",
+                        "be_db",
+                        "safe_uhe_increment",
+                        "cumulative_safe_uhe_dose",
+                        "decision_state",
+                        "decision_label",
                         "note",
                     ],
                 )
@@ -3791,6 +4224,20 @@ class AcquisitionWorker(QObject):
                                 treatment_result.sample_rate_hz,
                             )
 
+                            pair_metrics = analyze_fus_probe_pair(
+                                probe_result.voltage_mv,
+                                treatment_result.voltage_mv,
+                                probe_result.sample_rate_hz,
+                                generator_settings.frequency_hz,
+                                settings.probe_amplitude_vpp,
+                                settings.treatment_amplitude_vpp,
+                                feature_settings,
+                                cycle_id=cycle_index,
+                                captured_at_seconds=time.perf_counter() - run_started_monotonic,
+                                adc_full_scale_mv=5_000.0 if hardware.input_range == "pm5000" else 1_000.0,
+                            )
+                            decision = dose_tracker.update(pair_metrics)
+
                             final_probe_path = probe_dir / cycle_name
                             final_treatment_path = treatment_dir / cycle_name
                             shutil.move(str(probe_staging_path), str(final_probe_path))
@@ -3809,15 +4256,36 @@ class AcquisitionWorker(QObject):
                                     "burst_cycles": generator_settings.burst_cycles,
                                     "inter_burst_delay_ms": settings.inter_burst_delay_ms,
                                     "cycle_period_ms": settings.cycle_period_ms,
+                                    "probe_quality_db": f"{pair_metrics.probe_quality_db:.6g}",
+                                    "uhe_db": f"{pair_metrics.uhe_db:.6g}",
+                                    "uhe_active_band_count": decision.uhe_active_band_count,
+                                    "uhe_confirmed": decision.uhe_confirmed,
+                                    "be_db": f"{pair_metrics.be_db:.6g}",
+                                    "safe_uhe_increment": f"{decision.safe_uhe_increment:.6g}",
+                                    "cumulative_safe_uhe_dose": f"{decision.cumulative_safe_uhe_dose:.6g}",
+                                    "decision_state": decision.state,
+                                    "decision_label": decision.label,
                                     "note": "",
                                 }
                             )
                             manifest_file.flush()
                             probe_rms = float(np.std(probe_result.voltage_mv))
                             treatment_rms = float(np.std(treatment_result.voltage_mv))
+                            self.fus_probe_pair_ready.emit(
+                                FusProbeAnalysisFrame(
+                                    cycle_id=cycle_index,
+                                    captured_at=treatment_time,
+                                    metrics=pair_metrics,
+                                    decision=decision,
+                                )
+                            )
                             self.log_message.emit(
                                 f"FUS–Probe cycle {cycle_index} saved: probe/treatment {cycle_name}; "
-                                f"RMS {probe_rms:.3f}/{treatment_rms:.3f} mV."
+                                f"RMS {probe_rms:.3f}/{treatment_rms:.3f} mV; "
+                                f"UHE {pair_metrics.uhe_db:.2f} dB ({decision.uhe_active_band_count}/"
+                                f"{settings.uhe_minimum_confirmed_bands} bands), BE {pair_metrics.be_db:.2f} dB, "
+                                f"dose {decision.cumulative_safe_uhe_dose:.2f}; "
+                                f"{decision.label}."
                             )
                         except Exception as exc:
                             self._move_fus_probe_staging_files(staging_dir, failed_dir)
@@ -3835,6 +4303,15 @@ class AcquisitionWorker(QObject):
                                     "burst_cycles": generator_settings.burst_cycles,
                                     "inter_burst_delay_ms": settings.inter_burst_delay_ms,
                                     "cycle_period_ms": settings.cycle_period_ms,
+                                    "probe_quality_db": "",
+                                    "uhe_db": "",
+                                    "uhe_active_band_count": "",
+                                    "uhe_confirmed": "",
+                                    "be_db": "",
+                                    "safe_uhe_increment": "",
+                                    "cumulative_safe_uhe_dose": "",
+                                    "decision_state": "failed",
+                                    "decision_label": "采集失败",
                                     "note": str(exc),
                                 }
                             )
@@ -3859,6 +4336,111 @@ class AcquisitionWorker(QObject):
             generator.close()
             self._move_fus_probe_staging_files(staging_dir, failed_dir)
             self.log_message.emit(f"FUS–Probe capture finished after {cycle_index} cycle(s).")
+
+    def _run_fus_probe_playback(self) -> None:
+        run_dirs = resolve_fus_probe_run_dirs(self.settings.playback.source_patterns)
+        if not run_dirs:
+            raise FileNotFoundError(
+                "FUS–Probe 回放需要选择包含 manifest.csv、probe/ 和 treatment/ 的运行目录。"
+            )
+
+        pair_by_treatment_path: dict[str, tuple[Path, dict[str, str]]] = {}
+        playback_files: list[Path] = []
+        for run_dir in run_dirs:
+            with (run_dir / "manifest.csv").open("r", newline="", encoding="utf-8-sig") as manifest_file:
+                for row in csv.DictReader(manifest_file):
+                    if row.get("status") != "complete":
+                        continue
+                    probe_path = (run_dir / row["probe_file"]).resolve()
+                    treatment_path = (run_dir / row["treatment_file"]).resolve()
+                    if not probe_path.exists() or not treatment_path.exists():
+                        self.log_message.emit(
+                            f"FUS–Probe playback skipped missing pair: {run_dir.name} cycle {row.get('cycle_id', '?')}"
+                        )
+                        continue
+                    playback_files.append(treatment_path)
+                    pair_by_treatment_path[str(treatment_path).lower()] = (run_dir, row)
+        if not playback_files:
+            raise FileNotFoundError("No complete FUS–Probe pairs were found in the selected run folder(s).")
+
+        with self._playback_lock:
+            self._playback_files = playback_files
+            self._playback_current_index = 0
+            self._playback_paused = False
+            self._playback_step_delta = 0
+            self._playback_delete_requested = False
+            self._playback_reference_copy_target = None
+        self._emit_playback_state(is_active=True)
+        self.log_message.emit(
+            f"FUS–Probe paired playback prepared: {len(run_dirs)} run(s), {len(playback_files)} complete pairs."
+        )
+
+        feature_settings = self.settings.fus_probe.feature_settings()
+        dose_tracker = FusProbeDoseTracker(self.settings.fus_probe.decision_settings())
+        previous_run: Path | None = None
+        previous_position = 0
+        sequence_index = 0
+        while not self._stop_requested:
+            treatment_path, current_position, total_frames = self._current_playback_file_state()
+            if treatment_path is None:
+                return
+            run_dir, row = pair_by_treatment_path[str(treatment_path).lower()]
+            if previous_run != run_dir or current_position <= previous_position:
+                dose_tracker.reset()
+            previous_run = run_dir
+            previous_position = current_position
+
+            probe_path = (run_dir / row["probe_file"]).resolve()
+            probe_signal, probe_rate_hz = load_signal_csv(
+                probe_path, self.settings.analysis.target_sample_count
+            )
+            treatment_signal, treatment_rate_hz = load_signal_csv(
+                treatment_path, self.settings.analysis.target_sample_count
+            )
+            effective_probe_rate = probe_rate_hz or self.settings.hardware.sample_rate_hz
+            effective_treatment_rate = treatment_rate_hz or self.settings.hardware.sample_rate_hz
+            if abs(effective_probe_rate - effective_treatment_rate) > 1e-6:
+                raise ValueError(f"FUS–Probe playback sample-rate mismatch: {run_dir.name} cycle {row['cycle_id']}")
+
+            sequence_index += 1
+            metrics = analyze_fus_probe_pair(
+                probe_signal,
+                treatment_signal,
+                effective_probe_rate,
+                float(row["frequency_hz"]),
+                float(row["probe_vpp"]),
+                float(row["treatment_vpp"]),
+                feature_settings,
+                cycle_id=int(row["cycle_id"]),
+                captured_at_seconds=float(current_position - 1) * self.settings.playback.interval_ms / 1000.0,
+                adc_full_scale_mv=5_000.0 if self.settings.hardware.input_range == "pm5000" else 1_000.0,
+            )
+            decision = dose_tracker.update(metrics)
+            treatment_time_text = row.get("treatment_captured_at", "")
+            try:
+                captured_at = datetime.fromisoformat(treatment_time_text)
+            except ValueError:
+                captured_at = datetime.now()
+            self.fus_probe_pair_ready.emit(
+                FusProbeAnalysisFrame(
+                    cycle_id=int(row["cycle_id"]),
+                    captured_at=captured_at,
+                    metrics=metrics,
+                    decision=decision,
+                )
+            )
+            self._emit_playback_state(is_active=True)
+            self.log_message.emit(
+                f"FUS–Probe playback {current_position}/{total_frames}: {run_dir.name}/cycle_{int(row['cycle_id']):06d}; "
+                f"UHE {metrics.uhe_db:.2f} dB ({decision.uhe_active_band_count}/"
+                f"{self.settings.fus_probe.uhe_minimum_confirmed_bands} bands), BE {metrics.be_db:.2f} dB, "
+                f"dose {decision.cumulative_safe_uhe_dose:.2f}; "
+                f"{decision.label}."
+            )
+
+            action, _ = self._wait_for_playback_action(self.settings.playback.interval_ms)
+            if action == "stop" or not self._advance_playback_index():
+                return
 
     def _sleep_with_stop(self, interval_ms: int) -> bool:
         deadline = time.time() + max(interval_ms, 0) / 1000.0
@@ -4029,7 +4611,8 @@ class MainWindow(QMainWindow):
         root_layout.addWidget(splitter)
 
         left_panel = QWidget()
-        left_panel.setMaximumWidth(600)
+        left_panel.setMinimumWidth(380)
+        left_panel.setMaximumWidth(820)
         left_outer_layout = QVBoxLayout(left_panel)
         left_outer_layout.setContentsMargins(8, 8, 8, 8)
         left_outer_layout.setSpacing(8)
@@ -4057,6 +4640,10 @@ class MainWindow(QMainWindow):
         self.playback_interval_spin = QSpinBox()
         self.playback_interval_spin.setRange(50, 10_000)
         self.playback_interval_spin.setSuffix(" ms")
+        self.playback_points_spin = QSpinBox()
+        self.playback_points_spin.setRange(512, 1_000_000)
+        self.playback_points_spin.setSingleStep(512)
+        self.playback_points_spin.setSuffix(" 点")
         self.playback_loop_check = QCheckBox("循环回放")
         self.playback_position_label = QLabel("- / -")
         self.playback_file_label = QLabel("-")
@@ -4098,6 +4685,7 @@ class MainWindow(QMainWindow):
         self.playback_group = QGroupBox("回放设置")
         playback_form = QFormLayout(self.playback_group)
         playback_form.addRow("CSV 来源", self._build_path_row(self.playback_source_edit, self.playback_browse_button))
+        playback_form.addRow("回放点数", self.playback_points_spin)
         playback_form.addRow("帧间隔", self.playback_interval_spin)
         playback_form.addRow("", self.playback_loop_check)
         playback_form.addRow("当前位置", self.playback_position_label)
@@ -4211,14 +4799,21 @@ class MainWindow(QMainWindow):
         hardware_form.addRow("触发源", self.trigger_source_combo)
         hardware_form.addRow("读超时", self.timeout_spin)
         hardware_form.addRow("", self.save_csv_check)
-        hardware_form.addRow("输出目录", self._build_path_row(self.output_dir_edit, self.output_dir_browse_button))
         hardware_group_layout.addWidget(self.hardware_content_widget)
+        hardware_output_widget = QWidget()
+        hardware_output_form = QFormLayout(hardware_output_widget)
+        hardware_output_form.setContentsMargins(0, 0, 0, 0)
+        hardware_output_form.addRow("输出目录", self._build_path_row(self.output_dir_edit, self.output_dir_browse_button))
+        hardware_group_layout.addWidget(hardware_output_widget)
         left_layout.addWidget(self.hardware_group)
         self.hardware_section_expanded = True
         self._set_hardware_section_expanded(False)
 
         self.signal_resource_combo = QComboBox()
         self.signal_resource_combo.setEditable(True)
+        self.signal_resource_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.signal_resource_combo.setMinimumContentsLength(10)
+        self.signal_resource_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.signal_scan_button = QPushButton("扫描")
         self.signal_scan_button.clicked.connect(self._scan_signal_generator_resources)
         self.signal_connect_button = QPushButton("连接")
@@ -4227,6 +4822,7 @@ class MainWindow(QMainWindow):
         self.signal_disconnect_button.clicked.connect(self._disconnect_signal_generator)
         self.signal_identity_label = QLabel("未连接")
         self.signal_identity_label.setWordWrap(True)
+        self.signal_identity_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
 
         self.signal_timeout_spin = QSpinBox()
         self.signal_timeout_spin.setRange(500, 30_000)
@@ -4283,36 +4879,42 @@ class MainWindow(QMainWindow):
         signal_connection_layout = QHBoxLayout(signal_connection_row)
         signal_connection_layout.setContentsMargins(0, 0, 0, 0)
         signal_connection_layout.setSpacing(4)
-        signal_connection_layout.addWidget(self.signal_connect_button)
-        signal_connection_layout.addWidget(self.signal_disconnect_button)
+        signal_connection_layout.addWidget(self.signal_connect_button, stretch=1)
+        signal_connection_layout.addWidget(self.signal_disconnect_button, stretch=1)
 
         signal_action_row = QWidget()
         signal_action_layout = QHBoxLayout(signal_action_row)
         signal_action_layout.setContentsMargins(0, 0, 0, 0)
         signal_action_layout.setSpacing(4)
-        signal_action_layout.addWidget(self.signal_apply_button)
-        signal_action_layout.addWidget(self.signal_output_off_button)
-        signal_action_layout.addWidget(self.signal_output_on_button)
+        for button in (
+            self.signal_apply_button,
+            self.signal_output_off_button,
+            self.signal_output_on_button,
+        ):
+            button.setMinimumWidth(0)
+            signal_action_layout.addWidget(button, stretch=1)
 
         self.signal_generator_group = QGroupBox("信号发生器手动设置")
         signal_group_layout = QVBoxLayout(self.signal_generator_group)
         signal_group_layout.setContentsMargins(8, 8, 8, 8)
         signal_group_layout.setSpacing(6)
         signal_header_row = QWidget()
-        signal_header_layout = QHBoxLayout(signal_header_row)
+        signal_header_layout = QGridLayout(signal_header_row)
         signal_header_layout.setContentsMargins(0, 0, 0, 0)
-        signal_header_layout.setSpacing(6)
-        signal_header_layout.addWidget(QLabel("电压"), stretch=0)
-        signal_header_layout.addWidget(self.signal_amplitude_spin, stretch=1)
+        signal_header_layout.setHorizontalSpacing(6)
+        signal_header_layout.setVerticalSpacing(4)
+        signal_header_layout.addWidget(QLabel("电压"), 0, 0)
+        signal_header_layout.addWidget(self.signal_amplitude_spin, 0, 1)
         self.signal_connection_badge = QLabel("未连接")
         self.signal_connection_badge.setAlignment(Qt.AlignCenter)
         self.signal_output_badge = QLabel("输出未知")
         self.signal_output_badge.setAlignment(Qt.AlignCenter)
-        signal_header_layout.addWidget(self.signal_connection_badge)
-        signal_header_layout.addWidget(self.signal_output_badge)
         self.signal_generator_toggle_button = QPushButton("展开")
         self.signal_generator_toggle_button.clicked.connect(self._toggle_signal_generator_section)
-        signal_header_layout.addWidget(self.signal_generator_toggle_button)
+        signal_header_layout.addWidget(self.signal_generator_toggle_button, 0, 2)
+        signal_header_layout.addWidget(self.signal_connection_badge, 1, 0, 1, 2)
+        signal_header_layout.addWidget(self.signal_output_badge, 1, 2)
+        signal_header_layout.setColumnStretch(1, 1)
         signal_group_layout.addWidget(signal_header_row)
 
         self.signal_generator_content_widget = QWidget()
@@ -4421,6 +5023,68 @@ class MainWindow(QMainWindow):
         self.fus_probe_cycle_period_spin = QSpinBox()
         self.fus_probe_cycle_period_spin.setRange(100, 60_000)
         self.fus_probe_cycle_period_spin.setSuffix(" ms")
+        self.fus_uhe_orders_edit = QLineEdit()
+        self.fus_uhe_band_spin = QDoubleSpinBox()
+        self.fus_uhe_band_spin.setRange(1.0, 200.0)
+        self.fus_uhe_band_spin.setDecimals(1)
+        self.fus_uhe_band_spin.setSuffix(" kHz")
+        self.fus_exclusion_band_spin = QDoubleSpinBox()
+        self.fus_exclusion_band_spin.setRange(1.0, 500.0)
+        self.fus_exclusion_band_spin.setDecimals(1)
+        self.fus_exclusion_band_spin.setSuffix(" kHz")
+        self.fus_bb_low_spin = QDoubleSpinBox()
+        self.fus_bb_low_spin.setRange(0.5, 20.0)
+        self.fus_bb_low_spin.setDecimals(2)
+        self.fus_bb_high_spin = QDoubleSpinBox()
+        self.fus_bb_high_spin.setRange(0.5, 20.0)
+        self.fus_bb_high_spin.setDecimals(2)
+        fus_bb_range_row = QWidget()
+        fus_bb_range_layout = QHBoxLayout(fus_bb_range_row)
+        fus_bb_range_layout.setContentsMargins(0, 0, 0, 0)
+        fus_bb_range_layout.addWidget(self.fus_bb_low_spin)
+        fus_bb_range_layout.addWidget(QLabel("至"))
+        fus_bb_range_layout.addWidget(self.fus_bb_high_spin)
+        self.fus_probe_quality_spin = QDoubleSpinBox()
+        self.fus_probe_quality_spin.setRange(-20.0, 100.0)
+        self.fus_probe_quality_spin.setDecimals(1)
+        self.fus_probe_quality_spin.setSuffix(" dB")
+        self.fus_uhe_correction_spin = QDoubleSpinBox()
+        self.fus_uhe_correction_spin.setRange(-60.0, 60.0)
+        self.fus_uhe_correction_spin.setDecimals(2)
+        self.fus_uhe_correction_spin.setSuffix(" dB")
+        self.fus_be_correction_spin = QDoubleSpinBox()
+        self.fus_be_correction_spin.setRange(-60.0, 60.0)
+        self.fus_be_correction_spin.setDecimals(2)
+        self.fus_be_correction_spin.setSuffix(" dB")
+        self.fus_uhe_activation_spin = QDoubleSpinBox()
+        self.fus_uhe_activation_spin.setRange(-20.0, 60.0)
+        self.fus_uhe_activation_spin.setDecimals(1)
+        self.fus_uhe_activation_spin.setSuffix(" dB")
+        self.fus_uhe_confirmed_bands_spin = QSpinBox()
+        self.fus_uhe_confirmed_bands_spin.setRange(1, 16)
+        self.fus_be_risk_spin = QDoubleSpinBox()
+        self.fus_be_risk_spin.setRange(-20.0, 60.0)
+        self.fus_be_risk_spin.setDecimals(1)
+        self.fus_be_risk_spin.setSuffix(" dB")
+        self.fus_open_dose_spin = QDoubleSpinBox()
+        self.fus_open_dose_spin.setRange(0.001, 1_000_000.0)
+        self.fus_open_dose_spin.setDecimals(2)
+        self.fus_open_dose_spin.setSuffix(" a.u.")
+        self.fus_thresholds_calibrated_check = QCheckBox("已用 BBB/损伤真实终点完成标定")
+        self.fus_show_uhe_curve_check = QCheckBox("UHE")
+        self.fus_show_be_curve_check = QCheckBox("BE")
+        self.fus_show_dose_curve_check = QCheckBox("累计剂量")
+        fus_curve_visibility_row = QWidget()
+        fus_curve_visibility_layout = QHBoxLayout(fus_curve_visibility_row)
+        fus_curve_visibility_layout.setContentsMargins(0, 0, 0, 0)
+        fus_curve_visibility_layout.setSpacing(8)
+        for checkbox in (
+            self.fus_show_uhe_curve_check,
+            self.fus_show_be_curve_check,
+            self.fus_show_dose_curve_check,
+        ):
+            fus_curve_visibility_layout.addWidget(checkbox)
+        fus_curve_visibility_layout.addStretch(1)
 
         self.analysis_group = QGroupBox("PCD 分析设置")
         analysis_group_layout = QVBoxLayout(self.analysis_group)
@@ -4482,15 +5146,28 @@ class MainWindow(QMainWindow):
         iud_algorithm_form.addRow("固定 f0", self.iud_fixed_f0_spin)
         self.algorithm_settings_stack.addWidget(iud_algorithm_group)
 
-        fus_probe_algorithm_group = QGroupBox("FUS–Probe 采集验证设置")
+        fus_probe_algorithm_group = QGroupBox("FUS–Probe UHE–BE 设置")
         fus_probe_algorithm_form = QFormLayout(fus_probe_algorithm_group)
         fus_probe_algorithm_form.addRow("探测电压", self.fus_probe_amplitude_spin)
         fus_probe_algorithm_form.addRow("治疗电压", self.fus_treatment_amplitude_spin)
         fus_probe_algorithm_form.addRow("探测后等待", self.fus_probe_delay_spin)
         fus_probe_algorithm_form.addRow("周期", self.fus_probe_cycle_period_spin)
+        fus_probe_algorithm_form.addRow("UHE 超谐波阶次（主）", self.fus_uhe_orders_edit)
+        fus_probe_algorithm_form.addRow("UHE 频带半宽", self.fus_uhe_band_spin)
+        fus_probe_algorithm_form.addRow("BE 排除半宽", self.fus_exclusion_band_spin)
+        fus_probe_algorithm_form.addRow("BE 倍频范围", fus_bb_range_row)
+        fus_probe_algorithm_form.addRow("Probe 质量阈值", self.fus_probe_quality_spin)
+        fus_probe_algorithm_form.addRow("UHE 系统补偿", self.fus_uhe_correction_spin)
+        fus_probe_algorithm_form.addRow("BE 系统补偿", self.fus_be_correction_spin)
+        fus_probe_algorithm_form.addRow("UHE 起效候选线", self.fus_uhe_activation_spin)
+        fus_probe_algorithm_form.addRow("UHE 最少一致子带", self.fus_uhe_confirmed_bands_spin)
+        fus_probe_algorithm_form.addRow("BE 风险候选线", self.fus_be_risk_spin)
+        fus_probe_algorithm_form.addRow("开窗剂量候选线", self.fus_open_dose_spin)
+        fus_probe_algorithm_form.addRow("显示曲线", fus_curve_visibility_row)
+        fus_probe_algorithm_form.addRow("阈值状态", self.fus_thresholds_calibrated_check)
         fus_probe_note = QLabel(
-            "仅支持 Hardware 真机模式。每周期按 Probe → Treatment 采集；"
-            "原始 CSV 将强制保存至本次运行目录的 probe/ 和 treatment/，并由 manifest.csv 一一配对。"
+            "每周期按 Probe → Treatment 配对计算 UHE、BE 与累计安全 UHE 剂量；"
+            "默认补偿来自 2026-07-12 水槽数据；阈值应结合 BBB/损伤真实终点数据验证。"
         )
         fus_probe_note.setWordWrap(True)
         fus_probe_algorithm_form.addRow("说明", fus_probe_note)
@@ -4690,21 +5367,51 @@ class MainWindow(QMainWindow):
         fus_probe_result_layout = QVBoxLayout(fus_probe_result_page)
         fus_probe_result_layout.setContentsMargins(8, 8, 8, 8)
         fus_probe_result_layout.setSpacing(10)
-        fus_probe_status_group = QGroupBox("FUS–Probe 采集验证")
-        fus_probe_status_layout = QVBoxLayout(fus_probe_status_group)
-        fus_probe_status_label = QLabel(
-            "当前阶段仅验证发生器的 Probe → Treatment 自动切换、ART 触发采集和文件配对。\n"
-            "分析、回放和闭环控制将在采集验证通过后再加入。"
-        )
-        fus_probe_status_label.setWordWrap(True)
-        fus_probe_status_layout.addWidget(fus_probe_status_label)
-        fus_probe_result_layout.addWidget(fus_probe_status_group)
+        fus_probe_status_group = QGroupBox("FUS–Probe UHE–BE 状态")
+        fus_probe_status_layout = QGridLayout(fus_probe_status_group)
+        self.fus_probe_state_label = QLabel("等待配对数据")
+        self.fus_probe_state_label.setAlignment(Qt.AlignCenter)
+        self.fus_probe_state_label.setStyleSheet(self._badge_style("#f1f5f9", "#94a3b8", "#475569"))
+        self.fus_probe_rationale_label = QLabel("阈值应结合 BBB/损伤真实终点数据验证。")
+        self.fus_probe_rationale_label.setWordWrap(True)
+        self.fus_probe_latest_cycle_label = QLabel("-")
+        self.fus_probe_latest_quality_label = QLabel("-")
+        self.fus_probe_latest_uhe_label = QLabel("-")
+        self.fus_probe_latest_uhe_consensus_label = QLabel("-")
+        self.fus_probe_latest_be_label = QLabel("-")
+        self.fus_probe_latest_dose_label = QLabel("-")
+        fus_probe_status_layout.addWidget(self.fus_probe_state_label, 0, 0, 1, 4)
+        fus_probe_status_layout.addWidget(self.fus_probe_rationale_label, 1, 0, 1, 4)
+        fus_probe_status_layout.addWidget(QLabel("Cycle"), 2, 0)
+        fus_probe_status_layout.addWidget(self.fus_probe_latest_cycle_label, 2, 1)
+        fus_probe_status_layout.addWidget(QLabel("Probe 质量"), 2, 2)
+        fus_probe_status_layout.addWidget(self.fus_probe_latest_quality_label, 2, 3)
+        fus_probe_status_layout.addWidget(QLabel("UHE（主）"), 3, 0)
+        fus_probe_status_layout.addWidget(self.fus_probe_latest_uhe_label, 3, 1)
+        fus_probe_status_layout.addWidget(QLabel("BE"), 3, 2)
+        fus_probe_status_layout.addWidget(self.fus_probe_latest_be_label, 3, 3)
+        fus_probe_status_layout.addWidget(QLabel("UHE 一致子带"), 4, 0)
+        fus_probe_status_layout.addWidget(self.fus_probe_latest_uhe_consensus_label, 4, 1)
+        fus_probe_status_layout.addWidget(QLabel("累计安全 UHE 剂量"), 4, 2)
+        fus_probe_status_layout.addWidget(self.fus_probe_latest_dose_label, 4, 3)
+        fus_probe_result_layout.addWidget(fus_probe_status_group, stretch=0)
+        self.fus_probe_trend_widget = FusProbeTrendWidget()
+        fus_probe_result_layout.addWidget(self.fus_probe_trend_widget, stretch=5)
+        for checkbox in (
+            self.fus_show_uhe_curve_check,
+            self.fus_show_be_curve_check,
+            self.fus_show_dose_curve_check,
+        ):
+            checkbox.toggled.connect(self._update_fus_probe_trend_visibility)
+        self.fus_probe_spectrum_widget = FusProbeSpectrumOverlayWidget()
+        fus_probe_result_layout.addWidget(self.fus_probe_spectrum_widget, stretch=4)
         fus_probe_log_group = QGroupBox("日志")
         fus_probe_log_layout = QVBoxLayout(fus_probe_log_group)
         self.fus_probe_log_output = QPlainTextEdit()
         self.fus_probe_log_output.setReadOnly(True)
         fus_probe_log_layout.addWidget(self.fus_probe_log_output)
-        fus_probe_result_layout.addWidget(fus_probe_log_group, stretch=1)
+        fus_probe_log_group.setMaximumHeight(145)
+        fus_probe_result_layout.addWidget(fus_probe_log_group, stretch=2)
         self.algorithm_result_stack.addWidget(fus_probe_result_page)
 
         contrast_result_page = QWidget()
@@ -4736,9 +5443,8 @@ class MainWindow(QMainWindow):
 
         left_scroll = QScrollArea()
         left_scroll.setWidgetResizable(True)
-        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         left_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        left_scroll.setMaximumWidth(620)
         left_scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
         left_scroll.setWidget(left_settings_panel)
         left_outer_layout.addWidget(left_scroll, stretch=1)
@@ -4746,7 +5452,10 @@ class MainWindow(QMainWindow):
 
         splitter.addWidget(left_panel)
         splitter.addWidget(right_panel)
-        splitter.setSizes([500, 940])
+        splitter.setChildrenCollapsible(False)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([560, 880])
         self._apply_visual_theme()
         self._set_signal_connection_visual(False)
 
@@ -4872,6 +5581,13 @@ class MainWindow(QMainWindow):
     def _sync_iud_window_limits(self) -> None:
         self.iud_baseline_window_count_spin.setMaximum(self.iud_window_count_spin.value())
 
+    def _update_fus_probe_trend_visibility(self) -> None:
+        self.fus_probe_trend_widget.set_visible_series(
+            show_uhe=self.fus_show_uhe_curve_check.isChecked(),
+            show_be=self.fus_show_be_curve_check.isChecked(),
+            show_dose=self.fus_show_dose_curve_check.isChecked(),
+        )
+
     def _connect_analysis_summary_signals(self) -> None:
         self.algorithm_combo.currentTextChanged.connect(self._refresh_analysis_summary)
         self.spectrum_mode_combo.currentTextChanged.connect(self._refresh_analysis_summary)
@@ -4925,6 +5641,7 @@ class MainWindow(QMainWindow):
         mode_index = self.mode_combo.findData(settings.ui.last_mode)
         self.mode_combo.setCurrentIndex(max(mode_index, 0))
         self.playback_source_edit.setText(join_patterns(settings.playback.source_patterns))
+        self.playback_points_spin.setValue(settings.playback.target_sample_count)
         self.playback_interval_spin.setValue(settings.playback.interval_ms)
         self.playback_loop_check.setChecked(settings.playback.loop_playback)
         if settings.contrast.last_browse_dir:
@@ -4982,6 +5699,24 @@ class MainWindow(QMainWindow):
         self.fus_treatment_amplitude_spin.setValue(settings.fus_probe.treatment_amplitude_vpp)
         self.fus_probe_delay_spin.setValue(settings.fus_probe.inter_burst_delay_ms)
         self.fus_probe_cycle_period_spin.setValue(settings.fus_probe.cycle_period_ms)
+        self.fus_uhe_orders_edit.setText(", ".join(f"{value:g}" for value in settings.fus_probe.ultraharmonic_orders))
+        self.fus_uhe_band_spin.setValue(settings.fus_probe.spectral_half_width_hz / 1e3)
+        self.fus_exclusion_band_spin.setValue(settings.fus_probe.exclusion_half_width_hz / 1e3)
+        self.fus_bb_low_spin.setValue(settings.fus_probe.broadband_low_order)
+        self.fus_bb_high_spin.setValue(settings.fus_probe.broadband_high_order)
+        self.fus_probe_quality_spin.setValue(settings.fus_probe.probe_quality_threshold_db)
+        self.fus_uhe_correction_spin.setValue(settings.fus_probe.uhe_system_correction_db)
+        self.fus_be_correction_spin.setValue(settings.fus_probe.be_system_correction_db)
+        self.fus_uhe_activation_spin.setValue(settings.fus_probe.uhe_activation_threshold_db)
+        self.fus_uhe_confirmed_bands_spin.setValue(settings.fus_probe.uhe_minimum_confirmed_bands)
+        self.fus_be_risk_spin.setValue(settings.fus_probe.be_risk_threshold_db)
+        self.fus_open_dose_spin.setValue(settings.fus_probe.open_dose_threshold)
+        self.fus_thresholds_calibrated_check.setChecked(settings.fus_probe.thresholds_calibrated)
+        self.fus_show_uhe_curve_check.setChecked(settings.fus_probe.show_uhe_curve)
+        self.fus_show_be_curve_check.setChecked(settings.fus_probe.show_be_curve)
+        self.fus_show_dose_curve_check.setChecked(settings.fus_probe.show_dose_curve)
+        self.fus_probe_trend_widget.set_thresholds(settings.fus_probe)
+        self._update_fus_probe_trend_visibility()
         self.max_live_points_spin.setValue(settings.ui.max_live_points)
         self.show_reference_points_check.setChecked(settings.ui.show_reference_points)
         self.scatter_widget.set_show_reference_points(settings.ui.show_reference_points)
@@ -4996,7 +5731,18 @@ class MainWindow(QMainWindow):
         analysis_settings.spectrum_mode = self.spectrum_mode_combo.currentText()
         analysis_settings.use_segment_average = self.segment_count_spin.value() > 1
         analysis_settings.segment_count = self.segment_count_spin.value()
-        analysis_settings.target_sample_count = self.points_spin.value()
+        playback_settings = PlaybackSettings(
+            source_patterns=split_patterns(self.playback_source_edit.text()),
+            target_sample_count=self.playback_points_spin.value(),
+            interval_ms=self.playback_interval_spin.value(),
+            loop_playback=self.playback_loop_check.isChecked(),
+        )
+        playback_settings.validate()
+        analysis_settings.target_sample_count = (
+            playback_settings.target_sample_count
+            if self.mode_combo.currentData() == "playback"
+            else self.points_spin.value()
+        )
         analysis_settings.peak_half_width_hz = self.peak_half_width_spin.value() * 1e3
         analysis_settings.noise_half_width_hz = self.noise_half_width_spin.value() * 1e3
         analysis_settings.broadband_half_width_hz = self.broadband_half_width_spin.value() * 1e3
@@ -5015,12 +5761,28 @@ class MainWindow(QMainWindow):
             normal_reference_db=self.iud_normal_reference_spin.value(),
             fixed_f0_hz=self.iud_fixed_f0_spin.value() * 1e6,
         )
-        iud_settings.validate(self.points_spin.value())
+        iud_settings.validate(analysis_settings.target_sample_count)
         fus_probe_settings = FusProbeSettings(
             probe_amplitude_vpp=self.fus_probe_amplitude_spin.value(),
             treatment_amplitude_vpp=self.fus_treatment_amplitude_spin.value(),
             inter_burst_delay_ms=self.fus_probe_delay_spin.value(),
             cycle_period_ms=self.fus_probe_cycle_period_spin.value(),
+            ultraharmonic_orders=parse_float_list(self.fus_uhe_orders_edit.text()),
+            spectral_half_width_hz=self.fus_uhe_band_spin.value() * 1e3,
+            exclusion_half_width_hz=self.fus_exclusion_band_spin.value() * 1e3,
+            broadband_low_order=self.fus_bb_low_spin.value(),
+            broadband_high_order=self.fus_bb_high_spin.value(),
+            probe_quality_threshold_db=self.fus_probe_quality_spin.value(),
+            uhe_system_correction_db=self.fus_uhe_correction_spin.value(),
+            be_system_correction_db=self.fus_be_correction_spin.value(),
+            uhe_activation_threshold_db=self.fus_uhe_activation_spin.value(),
+            uhe_minimum_confirmed_bands=self.fus_uhe_confirmed_bands_spin.value(),
+            be_risk_threshold_db=self.fus_be_risk_spin.value(),
+            open_dose_threshold=self.fus_open_dose_spin.value(),
+            thresholds_calibrated=self.fus_thresholds_calibrated_check.isChecked(),
+            show_uhe_curve=self.fus_show_uhe_curve_check.isChecked(),
+            show_be_curve=self.fus_show_be_curve_check.isChecked(),
+            show_dose_curve=self.fus_show_dose_curve_check.isChecked(),
         )
         fus_probe_settings.validate()
 
@@ -5048,11 +5810,7 @@ class MainWindow(QMainWindow):
                 prf_hz=self.signal_prf_spin.value(),
                 burst_cycles=self.signal_cycles_spin.value(),
             ),
-            playback=PlaybackSettings(
-                source_patterns=split_patterns(self.playback_source_edit.text()),
-                interval_ms=self.playback_interval_spin.value(),
-                loop_playback=self.playback_loop_check.isChecked(),
-            ),
+            playback=playback_settings,
             contrast=ContrastSettings(
                 source_patterns=self._contrast_source_patterns_from_rows(),
                 recursive=self.contrast_recursive_check.isChecked(),
@@ -5111,7 +5869,11 @@ class MainWindow(QMainWindow):
         self.playback_file_label.setText(state.current_file or "-")
 
         can_pause = is_playback_mode and state.is_active and state.total_frames > 0
-        can_step = can_pause and state.is_paused
+        can_step = (
+            can_pause
+            and state.is_paused
+            and self.algorithm_combo.currentData() != "fus_probe_interleaved_v1"
+        )
         can_edit_reference = can_step and self.algorithm_combo.currentData() == "scd_icd_peak_v1"
         self.playback_pause_button.setEnabled(can_pause)
         self.playback_pause_button.setText("继续" if state.is_paused and can_pause else "暂停")
@@ -5462,6 +6224,16 @@ class MainWindow(QMainWindow):
         self.waveform_widget.clear_data()
         self.iud_curve_widget.clear_data()
         self.iud_treatment_trend_widget.clear_data()
+        self.fus_probe_trend_widget.clear_data()
+        self.fus_probe_spectrum_widget.clear_data()
+        self.fus_probe_state_label.setText("等待配对数据")
+        self.fus_probe_state_label.setStyleSheet(self._badge_style("#f1f5f9", "#94a3b8", "#475569"))
+        self.fus_probe_latest_uhe_consensus_label.setText("-")
+        self.fus_probe_rationale_label.setText(
+            "阈值已完成系统标定。" if self.settings.fus_probe.thresholds_calibrated
+            else "阈值应结合 BBB/损伤真实终点数据验证。"
+        )
+        self.fus_probe_trend_widget.set_thresholds(self.settings.fus_probe)
         self.contrast_chart_widget.clear_results()
         self.contrast_summary_label.setText("尚未生成对比结果。")
         self.contrast_progress_bar.setValue(0)
@@ -5518,7 +6290,13 @@ class MainWindow(QMainWindow):
         try:
             imported_settings = load_app_settings_from_path(Path(file_path))
             imported_settings.analysis.validate()
-            imported_settings.iud.validate(imported_settings.analysis.target_sample_count)
+            imported_settings.playback.validate()
+            imported_sample_count = (
+                imported_settings.playback.target_sample_count
+                if imported_settings.ui.last_mode == "playback"
+                else imported_settings.hardware.points
+            )
+            imported_settings.iud.validate(imported_sample_count)
             imported_settings.fus_probe.validate()
             self.settings = imported_settings
             self._apply_settings_to_ui(imported_settings)
@@ -5606,11 +6384,7 @@ class MainWindow(QMainWindow):
             self.append_log("Contrast start blocked: active algorithm is not SCD–ICD.")
             return
 
-        self.scatter_widget.clear_live_results()
-        self.spectrum_widget.clear_data()
-        self.waveform_widget.clear_data()
-        self.iud_curve_widget.clear_data()
-        self.iud_treatment_trend_widget.clear_data()
+        self._clear_live_points()
         if self.settings.ui.last_mode == "contrast":
             self.contrast_chart_widget.clear_results()
             self.contrast_summary_label.setText("正在计算对比结果...")
@@ -5632,6 +6406,7 @@ class MainWindow(QMainWindow):
         self.worker.contrast_point_ready.connect(self._on_contrast_point_ready)
         self.worker.contrast_progress_changed.connect(self._on_contrast_progress_changed)
         self.worker.playback_state_changed.connect(self._on_playback_state_changed)
+        self.worker.fus_probe_pair_ready.connect(self._on_fus_probe_pair_ready)
         self.worker.error.connect(self._on_worker_error)
         self.worker.finished.connect(self.worker_thread.quit)
         self.worker.finished.connect(self.worker.deleteLater)
@@ -5682,6 +6457,36 @@ class MainWindow(QMainWindow):
             self.contrast_progress_bar.setRange(0, 100)
             self.contrast_progress_bar.setValue(0)
             self.contrast_progress_label.setText("对比进度：准备中")
+
+    def _on_fus_probe_pair_ready(self, frame: FusProbeAnalysisFrame) -> None:
+        state_styles = {
+            "invalid": ("#f1f5f9", "#94a3b8", "#475569"),
+            "not_open": ("#dbeafe", "#3b82f6", "#1e40af"),
+            "open": ("#dcfce7", "#22c55e", "#166534"),
+            "risk": ("#fee2e2", "#ef4444", "#991b1b"),
+        }
+        background, border, foreground = state_styles.get(
+            frame.decision.state,
+            state_styles["invalid"],
+        )
+        self.fus_probe_state_label.setText(frame.decision.label)
+        self.fus_probe_state_label.setStyleSheet(self._badge_style(background, border, foreground))
+        self.fus_probe_rationale_label.setText(frame.decision.rationale)
+        self.fus_probe_latest_cycle_label.setText(str(frame.cycle_id))
+        self.fus_probe_latest_quality_label.setText(f"{frame.metrics.probe_quality_db:.2f} dB")
+        self.fus_probe_latest_uhe_label.setText(f"{frame.metrics.uhe_db:.3f} dB")
+        required_bands = self.settings.fus_probe.uhe_minimum_confirmed_bands
+        consensus_suffix = "已确认" if frame.decision.uhe_confirmed else "未确认"
+        self.fus_probe_latest_uhe_consensus_label.setText(
+            f"{frame.decision.uhe_active_band_count}/{required_bands} {consensus_suffix}"
+        )
+        self.fus_probe_latest_be_label.setText(f"{frame.metrics.be_db:.3f} dB")
+        self.fus_probe_latest_dose_label.setText(f"{frame.decision.cumulative_safe_uhe_dose:.3f} a.u.")
+        self.fus_probe_trend_widget.add_frame(frame, self.max_live_points_spin.value())
+        self.fus_probe_spectrum_widget.set_metrics(frame.metrics)
+        self.statusBar().showMessage(
+            f"FUS–Probe cycle {frame.cycle_id}: {frame.decision.label}"
+        )
 
     def _on_frame_ready(self, frame: AnalysisFrame) -> None:
         if isinstance(frame.metrics, IudMetrics):
@@ -5750,7 +6555,10 @@ class MainWindow(QMainWindow):
         if self.settings.ui.last_mode == "hardware" and self.signal_generator_client.connected:
             if self._set_signal_generator_output(False):
                 self.append_log("Signal generator output turned OFF after acquisition finished.")
-        if self.settings.analysis.algorithm_id == "fus_probe_interleaved_v1":
+        if (
+            self.settings.ui.last_mode == "hardware"
+            and self.settings.analysis.algorithm_id == "fus_probe_interleaved_v1"
+        ):
             self._set_signal_connection_visual(False)
             self.signal_generator_output_is_on = None
             self._update_signal_generator_output_buttons()
