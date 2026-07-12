@@ -129,3 +129,139 @@ fus_probe_YYYYMMDD_HHMMSS/
 ```
 
 `code/Temp/test.json` 已加入第二个提交，包含当时的本机路径、VISA 地址及测试配置。同步到另一台电脑后可作为导入设置方案使用，但其中的本机路径与设备地址应按实验室电脑实际情况复核。
+
+---
+
+## 2026-07-12：算法与右侧面板设计结论
+
+### 最终要输出的三种生物学状态
+
+FUS–Probe 算法的目标不是泛泛地判断“有没有空化”，而是判定：
+
+```text
+1. 未开 BBB
+2. 安全开 BBB
+3. 有安全风险
+```
+
+另保留一个灰色的**信号无效**提示：Probe 信号未能从噪声中可靠分离时，不能把它误判为“未开 BBB”。它只是测量质量状态，不是第四种生物学结论。
+
+### 采用的主算法：Probe 归一化 HE–BE 三态分析
+
+决定采用 HE（Harmonic Emission）和 BE（Broadband Emission）作为主指标，取代对新算法直接套用旧的 SCD–ICD reference 库。
+
+- HE：整数谐波频带能量，表征稳定空化；用于评价治疗是否有效、并形成累计有效剂量。
+- BE：避开谐波/超谐波后的宽带能量，表征惯性空化或危险风险；优先级高于开窗判定。
+- IUD：仍保留为 burst 内的提前失稳预警；它不是替代 HE/BE，而是补充 BE 可能出现得较晚的问题。
+- Probe：不是额外的 reference CSV，而是每一个 cycle 内与治疗 burst 配对的**动态参考**。
+
+每个 cycle 先得到 Probe 和 Treatment 两份 PCD 频谱：
+
+```text
+Hp：Probe 的谐波频带功率
+Ht：Treatment 的谐波频带功率
+Bp：Probe 的宽带功率
+Bt：Treatment 的宽带功率
+```
+
+建议的 Probe 归一化 HE/BE 形式：
+
+```text
+HE_k = treatment 谐波功率 / probe 对应谐波功率，经系统补偿后转 dB
+BE_k = treatment 宽带功率 / probe 对应宽带功率，经系统补偿后转 dB
+```
+
+可写为频带积分的形式：
+
+\[
+HE_k = 10\log_{10}\left(
+\frac{1}{|H|}\sum_{m\in H}
+\frac{\int_{W_m}PSD_T(f)df}
+{C_m\int_{W_m}PSD_P(f)df}
+\right)
+\]
+
+\[
+BE_k = 10\log_{10}\left(
+\frac{\int_{W_{BB}}PSD_T(f)df}
+{C_{BB}\int_{W_{BB}}PSD_P(f)df}
+\right)
+\]
+
+其中 `PSD_T` / `PSD_P` 分别为治疗和探测频谱；`W_m` 为第 m 个整数谐波频带；`W_BB` 为排除谐波与超谐波的宽带区。
+
+由于 Treatment 为 7 Vpp、Probe 为 4.5 Vpp，二者不能直接相除。`C_m` 和 `C_BB` 是两种电压下设备/耦合链路固有差异的**固定系统补偿**，应由一次水槽或无微泡标定获得。它不是实验运行时的 reference 库。
+
+### 三态判定逻辑
+
+只累计没有危险迹象的 HE，形成安全稳定空化剂量：
+
+\[
+HE_{dose}(k)=\sum_{i=1}^{k}HE_i\cdot
+\mathbf{1}(BE_i<\theta_{BE},\ IUD_i<\theta_{IUD})
+\]
+
+判定优先级：
+
+```text
+Probe 质量 Qp < θprobe
+    → 信号无效（灰色）
+
+BEk ≥ θBE，或 IUDk ≥ θIUD
+    → 有安全风险（红色）
+
+风险安全，且累计 HEdose < θopen
+    → 未开 BBB（蓝色）
+
+风险安全，且累计 HEdose ≥ θopen
+    → 安全开 BBB（绿色）
+```
+
+这套结构借鉴的关键思想：
+
+1. Konofagou/Sun：HE 控制稳定空化，BE 作为惯性空化安全约束；每个 burst 都计算频谱比值。
+2. ThUS/PCI：累计 PCI 比单点峰值 PCI 更能对应 BBB opening，因此“是否开 BBB”应看累计安全 HE 剂量，而不是某一个最大峰值。
+3. CEA IUD：burst 内超谐波变化可在明显宽带事件之前预警微泡失稳。
+4. Hong Chen：低压超声可作为个体化稳定空化参考；本项目用每个 cycle 的 Probe 取代单独的 Dummy Sonication。
+5. ETH 长循环微泡工作：将空化划分为稳定区 SO、过渡区 TR、惯性空化区 IC 和高压区 HP；本项目的“安全开 BBB / 风险”应当沿用这种分区思想。
+
+### 阈值的科学边界
+
+- 运行时不加载“有空化/无空化”reference CSV 库。
+- 但 `θprobe`、`θBE`、`θIUD`、`θopen` 不能从文献直接照搬。
+- 这些数值必须在本系统上，用 MRI、Evans blue、组织学或其他真实终点数据，把“未开 BBB / 成功开 BBB / 损伤”标定后固定下来。
+- 例如 IUD 文献的 8 dB 可以先作为 GUI 的候选显示线，但不能未经本系统验证直接宣称为危险阈值。
+
+### 右侧 FUS–Probe 专属面板设计
+
+建议右侧由上到下显示：
+
+```text
+1. 当前三态大标签 + cycle 状态时间轴
+   蓝：未开 BBB；绿：安全开 BBB；红：有风险；灰：信号无效
+
+2. HE 与累计 HEdose 曲线
+   显示每个治疗 cycle 的 HE、累计安全剂量和 θopen
+
+3. BE 与 IUD 安全曲线
+   显示 BE、IUD、θBE、θIUD；风险时突出红色标记
+
+4. 最新一对 Probe / Treatment 频谱叠加图
+   标出 HE 谐波频带与 BE 宽带频带，便于确认两段采集是否正确
+
+5. 最新 cycle 参数与判定依据
+   cycle 编号、Probe/Treatment Vpp、HE、BE、IUD、HEdose、最终状态
+
+6. 日志
+```
+
+### 第二阶段可选增强：α 频谱斜率
+
+CEA 2025 提出的 `α` 用宽带谱的频率斜率区分颅内空化与颞肌等颅外来源。它很适合作为“信号来源可信度”附加指标：当治疗 BE 升高但 α 不符合经颅衰减特征时，避免误触发危险报警。
+
+暂不把 α 放入第一版三态核心，因为它对 PCD 频带、经颅路径和系统几何强依赖，必须先用本系统数据验证。第一版先实现 HE/BE/IUD/累计剂量与三态面板。
+
+### 本次调研来源
+
+- `D:\Desktop\BPLab\组会报告\组会 2026.06.15 PCD前沿调研.pptx`
+- 重点复核页：3（HE/BE）、8（累计 PCI）、14（SO/TR/IC/HP 分区）、15（IUD）、16（α）、18–19（个体化 SC baseline）。
